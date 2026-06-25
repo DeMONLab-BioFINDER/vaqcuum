@@ -1,0 +1,3016 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-05-12"
+---
+
+# Initialization
+```{r}
+library(ggfittext)
+library(ggnewscale)
+library(patchwork)
+library(tidyverse)
+library(paletteer)
+library(viridis)
+
+'%notin%' <- Negate('%in%')
+roundNdecim <- function(x,N) {round((10^N)*x)/10^N}
+
+options(contrasts=c('contr.sum','contr.poly'))
+emmeans::emm_options(pbkrtest.limit = 5000, lmerTest.limit = 5000)
+```
+
+# Load data
+```{r}
+
+#### ------------- Quality metrics ------------- ####
+qc_metrics_a4 <- read_csv("inputs/quality_metrics/qc_metrics_a4.csv") 
+qc_metrics_rosmap <- read_csv("inputs/quality_metrics/qc_metrics_rosmap.csv") 
+qc_metrics_vallecas <- read_csv("inputs/quality_metrics/qc_metrics_vallecas.csv") 
+
+#### ------------- Visual ratings ------------- ####
+vis_rate_wide_a4 <- read_csv("inputs/vis_QC/A4_visual-QC.csv") |> 
+  mutate(session=paste0("ses-",str_pad(session, 3, pad = "0")),
+         subject=paste0("sub-",subject)) |> 
+  select(-vis_qc_comment) |> 
+  filter(vis_qc_criterion %in% c("Coregistration accuracy", "Distortions/dropouts")) |> 
+  mutate(vis_qc_criterion= case_when(vis_qc_criterion=="Coregistration accuracy" ~ "vr_coreg",
+                                            vis_qc_criterion=="Distortions/dropouts" ~ "vr_dropout")) |> 
+  distinct()|> 
+  mutate(vis_qc_rating = case_when(vis_qc_rating == 0 ~ "Fail",
+                                   vis_qc_rating == 1 ~ "Flag",
+                                   vis_qc_rating == 2 ~ "Pass")) |> 
+  pivot_wider(names_from =vis_qc_criterion, values_from = vis_qc_rating) |> 
+  mutate_if(is.character, as.factor)
+
+vis_rate_wide_rosmap <- read_csv("inputs/vis_QC/Rosmap_visual-QC.csv") |> 
+  select(-vis_qc_comment, -protocol) |> 
+  filter(vis_qc_criterion %in% c("Coregistration accuracy", "Distortions/dropouts", "Spatial normalization accuracy")) |> 
+  mutate(vis_qc_criterion= case_when(vis_qc_criterion=="Coregistration accuracy" ~ "vr_coreg",
+                                     vis_qc_criterion=="Distortions/dropouts" ~ "vr_dropout",
+                                     vis_qc_criterion=="Spatial normalization accuracy" ~ "vr_norm")) |> 
+  distinct()|> 
+  mutate(vis_qc_rating = case_when(vis_qc_rating == 0 ~ "Fail",
+                                   vis_qc_rating == 1 ~ "Flag",
+                                   vis_qc_rating == 2 ~ "Pass")) |> 
+  pivot_wider(names_from =vis_qc_criterion, values_from = vis_qc_rating) |> 
+  mutate_if(is.character, as.factor)
+
+
+vis_rate_wide_vallecas <- read_csv("inputs/vis_QC/Vallecas_visual-QC.csv") |>
+  distinct()|> 
+  rename(vr_coreg= vis_qc_coreg_score, vr_dropout= vis_qc_drop_score, vr_distor= vis_qc_dist_score) |> 
+  mutate(vr_coreg = case_when(vr_coreg == 0 ~ "Fail",
+                              vr_coreg == 1 ~ "Flag",
+                              vr_coreg == 2 ~ "Pass"),
+         vr_dropout = case_when(vr_dropout == 0 ~ "Fail",
+                                vr_dropout == 1 ~ "Flag",
+                                vr_dropout == 2 ~ "Pass"),
+         vr_distor = case_when(vr_distor == 0 ~ "Fail",
+                                vr_distor == 1 ~ "Flag",
+                                vr_distor == 2 ~ "Pass")) |> 
+  select(-contains(c("comment", "locs"))) |> 
+  mutate_if(is.character, as.factor)
+
+#### ------------- Age and sex ------------- ####
+demogs_a4 <- read_csv("inputs/demogs/a4/age_sex.csv") |> 
+  mutate(code= paste0("sub-", code)) 
+demogs_rosmap <- read_csv("inputs/demogs/rosmap/age_sex.csv")
+demogs_vallecas <- read_csv("inputs/demogs/vallecas/age_sex.csv")
+
+
+#### ------------- Merge ------------- ####
+data_a4 <- qc_metrics_a4 |> 
+  left_join(vis_rate_wide_a4, by=c("subject", "session")) |> 
+  left_join(demogs_a4, by="code") |> 
+  mutate_if(is.character, as.factor)
+
+data_rosmap <- qc_metrics_rosmap |> 
+  left_join(vis_rate_wide_rosmap, by=c("subject", "session")) |> 
+  left_join(demogs_rosmap, by="code") |> 
+  mutate_if(is.character, as.factor)
+
+data_vallecas <- qc_metrics_vallecas |> 
+  left_join(vis_rate_wide_vallecas, by="code") |> 
+  left_join(demogs_vallecas, by="code") |> 
+  mutate(sex=case_when(sex ==1 ~ "M",
+                       sex==2 ~ "F")) |> 
+  mutate_if(is.character, as.factor)
+
+```
+
+
+# Distribution-based thresholds
+```{r}
+
+
+# ------------------- Initialization:
+
+library(robustbase)
+library(reticulate)
+library(plotly)
+
+py_require(c("scikit-learn", "numpy","scipy"))
+GaussianMixture <- import("sklearn.mixture")$GaussianMixture # for gmm
+sp <- import("scipy.stats") # for evt
+
+# ------------------- Definition of functions: 
+
+## ---- GMM-related
+# extract components and order
+extract_components_gmm <- function(gmm) {
+
+  means <- as.numeric(gmm$means_)
+  sds <- sqrt(as.numeric(gmm$covariances_))
+  weights <- as.numeric(gmm$weights_)
+  idx <- order(means)
+
+  list(means = means[idx],
+       sds = sds[idx],
+       weights = weights[idx])
+}
+
+
+# compute cut-offs
+compute_cutoff_gmm <- function(means, sds, weights) {
+
+  if (length(means) < 2) return(numeric(0))
+
+  sapply(seq_len(length(means) - 1), function(i) {
+
+    optimize(function(c) {
+      abs(weights[i] * dnorm(c, means[i], sds[i]) -
+            weights[i+1] * dnorm(c, means[i+1], sds[i+1]))
+    }, interval = c(means[i], means[i+1]))$minimum
+  })
+}
+
+# ---- GMM based threshold
+gmm2_threshold <- function(x) {
+  tryCatch({
+    x <- na.omit(x)
+    x_mat <- matrix(x, ncol = 1)
+    gmm <- GaussianMixture(n_components = 2L, random_state = 42L, tol = 1e-5, max_iter = 300L, n_init = 5L, reg_covar = 1e-6)
+    gmm$fit(x_mat)
+    comp <- extract_components_gmm(gmm)
+    cuts <- compute_cutoff_gmm(comp$means, comp$sds, comp$weights)
+    list(cutoff = cuts[1],
+         means = comp$means,
+         sds = comp$sds,
+         weights = comp$weights)
+  }, error = function(e) list(cutoff = NA, means = c(NA, NA)))
+}
+
+# ---- Extreme value based threshold
+evt_threshold <- function(x, tail = c("high", "low"),
+                          u_quantile = 0.90, alpha = 0.01, min_excess = 20L) {
+  tail <- match.arg(tail)
+  x <- na.omit(x)
+  if (tail == "low")   x <- -x
+
+  u <- quantile(x, u_quantile) # peak over threshold 
+  excess <- x[x > u] - u # obs over pot, centered to 0 to make sense of floc=0
+  n_exc <- length(excess)
+  if (n_exc < min_excess) return(NA)
+
+  tryCatch({
+    fit <- sp$genpareto$fit(excess, floc = 0L) # fit generalized pareto distrib
+    xi <- fit[[1]]
+    sigma <- fit[[3]]
+    rate <- n_exc / length(x)
+    p <- 1 - alpha / rate
+
+    if (!is.finite(xi) || sigma <= 0 || abs(xi) > 1) return(NA)
+    if (p <= 0 || p >= 1) return(NA)
+
+    thr <- if_else(abs(xi) < 1e-8, u - sigma * log(1 - p), u + sigma / xi * ((1 - p)^-xi - 1))
+
+    if (tail == "low") -thr else thr
+
+  }, error = function(e) NA)
+}
+
+###########################################################################################################
+###########################################################################################################
+
+# ---- Compute thresholds (using previously defined functions)
+# higer = worse
+compute_thresholds_high_bad <- function(x, percentiles = c(0.90, 0.95), sd_multiplier = c(2, 3), evt_alpha = c(0.01, 0.02)) {
+  
+  x <- x[!is.na(x)]
+  
+  rows <- list()
+  
+  # percentiles
+  for (p in percentiles) {
+    rows[[length(rows) + 1]] <- tibble(
+      method = paste0("percentile_", p*100, "th"),
+      threshold = as.numeric(quantile(x, p)),
+      GMM2_means = list(NA),
+      GMM2_sds = list(NA),
+      GMM2_weights = list(NA)
+    )
+  }
+  
+  # mean + k*sd
+  for (k in sd_multiplier) {
+    rows[[length(rows) + 1]] <- tibble(
+      method = paste0("mean_", k, "sd"),
+      threshold = mean(x) + k * sd(x),
+      GMM2_means = list(NA),
+      GMM2_sds = list(NA),
+      GMM2_weights = list(NA)
+    )
+  }
+  
+  # median + k*mad
+  for (k in sd_multiplier) {
+    rows[[length(rows) + 1]] <- tibble(
+      method = paste0("median_", k, "mad"),
+      threshold = median(x) + k * mad(x),
+      GMM2_means = list(NA),
+      GMM2_sds = list(NA),
+      GMM2_weights = list(NA)
+    )
+  }
+  
+
+  # IQR
+  q <- quantile(x, c(0.25, 0.75))
+  iqr <- q[2] - q[1]
+  
+  rows[[length(rows) + 1]] <- tibble(
+    method = "IQR_x1.5",
+    threshold = q[2] + 1.5 * iqr,
+    GMM2_means = list(NA),
+    GMM2_sds = list(NA),
+    GMM2_weights = list(NA)
+  )
+  
+  rows[[length(rows) + 1]] <- tibble(
+    method = "IQR_x3",
+    threshold = q[2] + 3 * iqr,
+    GMM2_means = list(NA),
+    GMM2_sds = list(NA),
+    GMM2_weights = list(NA)
+  )
+  
+  # log IQR
+  if (all(x > 0)) {
+    lx <- log(x)
+    ql <- quantile(lx, c(0.25, 0.75))
+    iqrl <- ql[2] - ql[1]
+    
+    rows[[length(rows) + 1]] <- tibble(
+      method = "IQR_x1.5_log",
+      threshold = exp(ql[2] + 1.5 * iqrl),
+      GMM2_means = list(NA),
+      GMM2_sds = list(NA),
+      GMM2_weights = list(NA)
+    )
+    
+    rows[[length(rows) + 1]] <- tibble(
+      method = "IQR_x3_log",
+      threshold = exp(ql[2] + 3 * iqrl),
+      GMM2_means = list(NA),
+      GMM2_sds = list(NA),
+      GMM2_weights = list(NA)
+    )
+  }
+  
+  # adjusted boxplot
+  adj <- adjboxStats(x)
+  
+  rows[[length(rows) + 1]] <- tibble(
+    method = "adj_boxplot",
+    threshold = adj$fence[2],
+    GMM2_means = list(NA),
+    GMM2_sds = list(NA),
+    GMM2_weights = list(NA)
+  )
+  
+  # evt-based
+  for (a in evt_alpha) {
+    rows[[length(rows) + 1]] <- tibble(
+      method = paste0("EVT_a", a),
+      threshold = evt_threshold(x, tail = "high", alpha = a),
+      GMM2_means = list(NA),
+      GMM2_sds = list(NA),
+      GMM2_weights = list(NA)
+    )
+  }
+  
+  # GMM
+  gmm2 <- gmm2_threshold(x)
+  
+  rows[[length(rows) + 1]] <- tibble(
+    method = "GMM2",
+    threshold = gmm2$cutoff,
+    GMM2_means = list(gmm2$means),
+    GMM2_sds = list(gmm2$sds),
+    GMM2_weights = list(gmm2$weights)
+  )
+  
+  bind_rows(rows)
+}
+
+# lower = worse
+compute_thresholds_low_bad <- function(x, percentiles = c(0.10, 0.05), sd_multiplier = c(2, 3), evt_alpha = c(0.01, 0.02)) {
+  
+  x <- x[!is.na(x)]
+  
+  rows <- list()
+  
+  # percentiles
+  for (p in percentiles) {
+    rows[[length(rows) + 1]] <- tibble(
+      method = paste0("percentile_", p*100, "th"),
+      threshold = as.numeric(quantile(x, p)),
+      GMM2_means = list(NA),
+      GMM2_sds = list(NA),
+      GMM2_weights = list(NA)
+    )
+  }
+  
+  # mean - k*sd
+  for (k in sd_multiplier) {
+    rows[[length(rows) + 1]] <- tibble(
+      method = paste0("mean_", k, "sd"),
+      threshold = mean(x) - k * sd(x),
+      GMM2_means = list(NA),
+      GMM2_sds = list(NA),
+      GMM2_weights = list(NA)
+    )
+  }
+  
+  # median - k*mad
+  for (k in sd_multiplier) {
+    rows[[length(rows) + 1]] <- tibble(
+      method = paste0("median_", k, "mad"),
+      threshold = median(x) - k * mad(x),
+      GMM2_means = list(NA),
+      GMM2_sds = list(NA),
+      GMM2_weights = list(NA)
+    )
+  }
+  
+
+  # IQR
+  q <- quantile(x, c(0.25, 0.75))
+  iqr <- q[2] - q[1]
+  
+  rows[[length(rows) + 1]] <- tibble(
+    method = "IQR_x1.5",
+    threshold = q[1] - 1.5 * iqr,
+    GMM2_means = list(NA),
+    GMM2_sds = list(NA),
+    GMM2_weights = list(NA)
+  )
+  
+  rows[[length(rows) + 1]] <- tibble(
+    method = "IQR_x3",
+    threshold = q[1] - 3 * iqr,
+    GMM2_means = list(NA),
+    GMM2_sds = list(NA),
+    GMM2_weights = list(NA)
+  )
+  
+  # log IQR
+  if (all(x > 0)) {
+    lx <- log(x)
+    ql <- quantile(lx, c(0.25, 0.75))
+    iqrl <- ql[2] - ql[1]
+    
+    rows[[length(rows) + 1]] <- tibble(
+      method = "IQR_x1.5_log",
+      threshold = exp(ql[1] - 1.5 * iqrl),
+      GMM2_means = list(NA),
+      GMM2_sds = list(NA),
+      GMM2_weights = list(NA)
+    )
+    
+    rows[[length(rows) + 1]] <- tibble(
+      method = "IQR_x3_log",
+      threshold = exp(ql[1] - 3 * iqrl),
+      GMM2_means = list(NA),
+      GMM2_sds = list(NA),
+      GMM2_weights = list(NA)
+    )
+  }
+  
+  # adjusted boxplot
+
+  adj <- adjboxStats(x)
+  
+  rows[[length(rows) + 1]] <- tibble(
+    method = "adj_boxplot",
+    threshold = adj$fence[1],
+    GMM2_means = list(NA),
+    GMM2_sds = list(NA),
+    GMM2_weights = list(NA)
+  )
+  
+  # evt-based
+  for (a in evt_alpha) {
+    rows[[length(rows) + 1]] <- tibble(
+      method = paste0("EVT_a", a),
+      threshold = evt_threshold(x, tail = "low", alpha = a),
+      GMM2_means = list(NA),
+      GMM2_sds = list(NA),
+      GMM2_weights = list(NA)
+    )
+  }
+  
+  # GMM
+  gmm2 <- gmm2_threshold(x)
+  
+  rows[[length(rows) + 1]] <- tibble(
+    method = "GMM2",
+    threshold = gmm2$cutoff,
+    GMM2_means = list(gmm2$means),
+    GMM2_sds = list(gmm2$sds),
+    GMM2_weights = list(gmm2$weights)
+  )
+  
+  bind_rows(rows)
+}
+
+
+###########################################################################################################
+###########################################################################################################
+
+# ---- Create interactive plot
+plot_thresholds_interactive <- function(dataset,
+                                        metric,
+                                        id_var = "code",
+                                        df_thresholds,
+                                        direction = c("low", "high"),
+                                        nbins = 80,
+                                        metric_name = metric) {
+
+  direction <- match.arg(direction)
+
+  # Prepare dataframes
+  df <- dataset |>
+    select(x = all_of(metric), id = all_of(id_var)) |>
+    filter(!is.na(x))
+
+  thr_valid <- df_thresholds |>
+    filter(!is.na(threshold))
+
+  # Create metric's histogram and retrieve relevant values
+  
+  # h <- hist(df$x, breaks = nbins, plot = FALSE)
+  # 
+  # global_breaks <- h$breaks
+  # global_mids <- h$mids
+  # global_counts <- h$counts
+  # global_widths <- diff(global_breaks)
+  # max_global <- max(global_counts)
+  g <- df |> 
+    ggplot(aes(x = x)) + 
+    geom_histogram(bins = nbins)
+  b <- ggplot_build(g)$data[[1]]
+
+  global_breaks <- c(b$xmin, tail(b$xmax, 1))
+  global_mids <- b$x
+  global_counts <- b$count
+  global_widths <- diff(global_breaks)
+  max_global <- max(global_counts)
+
+  # define color scale
+  method_colors <- paletteer::paletteer_d("Polychrome::light", n = nrow(thr_valid)) |> as.character()
+
+  # --- is this row a GMM method with valid parameters?
+  is_gmm_valid <- function(i) {
+    grepl("GMM", thr_valid$method[i]) &&
+      !is.null(thr_valid$GMM2_means[[i]])  &&
+      !any(is.na(thr_valid$GMM2_means[[i]])) &&
+      !any(is.na(thr_valid$GMM2_sds[[i]]))  &&
+      !any(is.na(thr_valid$GMM2_weights[[i]]))
+  }
+
+  # Compute number of traces per method since they're different (3 standard + 2 density curves for GMM)
+  n_traces_per_method <- sapply(seq_len(nrow(thr_valid)), function(i) {
+    if (is_gmm_valid(i)) 5L else 3L
+  })
+
+  # base traces: 1 global histogram + 1 segment per threshold
+  n_base <- 2 + nrow(thr_valid)
+  n_thr <- sum(n_traces_per_method)
+  n_total <- n_base + n_thr
+
+  # start trace index for each method
+  trace_starts <- n_base + c(0, cumsum(head(n_traces_per_method, -1))) + 1
+
+  # ---- Base figure
+  fig <- plot_ly()
+
+  # ---- All thresholds view
+  fig <- fig |>
+    add_bars(x = global_mids,
+             y = global_counts,
+             width = global_widths,
+             marker = list(color = "black", line = list(color = "white", width = 0.5)),
+             opacity = 0.7,
+             name = paste0("Distribution (n=", nrow(df), ")"),
+             hovertemplate = "avg=%{x:.3f}<br>(n=%{y})<extra></extra>") |>
+    add_trace(x = df$x,
+            y = rep(-max_global * 0.02, nrow(df)),
+            type = "scatter",
+            mode = "markers",
+            marker = list(symbol = "line-ns-open",
+                          size = 8,
+                          color = "#00688b",
+                          opacity = 0.5),
+            name = "Data rug",
+            hoverinfo = "skip")
+
+  # for (i in seq_len(nrow(thr_valid))) {
+  #   fig <- fig |>
+  #     add_segments(x = thr_valid$threshold[i],
+  #                  xend = thr_valid$threshold[i],
+  #                  y = 0,
+  #                  yend = max_global * 1.05,
+  #                  line = list(color = method_colors[i], width = 1.5, dash = "solid"),
+  #                  name = thr_valid$method[i],
+  #                  hovertemplate = "cutoff=%{x:.3f}")
+  # }
+  for (i in seq_len(nrow(thr_valid))) {
+    y_seq <- seq(0, max_global * 1.05, length.out = 20)
+    
+    fig <- fig |>
+      add_trace(x = rep(thr_valid$threshold[i], length(y_seq)),
+                y = y_seq,
+                type = "scatter",
+                mode = "lines",
+                line = list(color = method_colors[i], width = 1.5, dash = "solid"),
+                name = thr_valid$method[i],
+                hovertemplate = paste0(thr_valid$method[i], ": cutoff=%{x:.3f}<extra></extra>"))
+  }
+  
+  # Visibility vector for "All thresholds" view
+  visibility <- list(c(rep(TRUE, n_base), rep(FALSE, n_thr)))
+
+  # ---- Threshold-specific views
+  for (i in seq_len(nrow(thr_valid))) {
+
+    thr <- thr_valid$threshold[i]
+    flagged <- if (direction == "low") df$x < thr else df$x > thr
+
+    ok <- df$x[!flagged]
+    bad <- df$x[flagged]
+
+    n_flag <- sum(flagged)
+    pct_flag <- round(100 * n_flag / nrow(df), 1)
+
+    local_breaks <- sort(unique(c(global_breaks, thr)))
+    local_mids <- head(local_breaks, -1) + diff(local_breaks) / 2
+    local_w <- diff(local_breaks)
+
+    h_ok <- hist(ok,  breaks = local_breaks, plot = FALSE, include.lowest = TRUE)
+    h_bad <- hist(bad, breaks = local_breaks, plot = FALSE, include.lowest = TRUE)
+
+    local_max <- max(h_ok$counts + h_bad$counts)
+
+    # Build codes of flagged obs per bin
+    bin_ids_bad <- vector("list", length(local_breaks) - 1)
+    for (b in seq_along(bin_ids_bad)) {
+      in_bin <- if (b == length(bin_ids_bad)) {
+        df$x >= local_breaks[b] & df$x <= local_breaks[b + 1]
+      } else {
+        df$x >= local_breaks[b] & df$x < local_breaks[b + 1]
+      }
+      bin_ids_bad[[b]] <- paste(df$id[in_bin & flagged], collapse = "<br>")
+    }
+    code4bad <- unlist(bin_ids_bad)
+
+    # Add okk/flag bars + threshold segment
+    y_seq <- seq(0, local_max * 1.05, length.out = 20)
+
+    fig <- fig |>
+      add_bars(x = local_mids,
+               y = h_ok$counts,
+               width = local_w,
+               marker = list(color = "#00cc66", line = list(color = "white", width = 0.5)),
+               opacity = 0.8,
+               name = paste0("Ok (n=", length(ok), ")"),
+               hovertemplate = "avg=%{x:.3f}<br>(n=%{y})<extra></extra>",
+               visible = FALSE) |>
+      add_bars(x = local_mids,
+               y = h_bad$counts,
+               width = local_w,
+               customdata = code4bad,
+               marker = list(color = "#e13102", line = list(color = "white", width = 0.5)),
+               opacity = 0.8,
+               name = paste0("Flags (n=", n_flag, ", ", pct_flag, "%)"),
+               hovertemplate = "avg=%{x:.3f} (n=%{y})<br>%{customdata}<extra></extra>",
+               visible = FALSE) |>
+      add_trace(x = rep(thr, length(y_seq)),
+                y = y_seq,
+                type = "scatter",
+                mode = "lines",
+                line = list(color = method_colors[i], width = 2, dash = "dash"),
+                name = thr_valid$method[i],
+                hovertemplate = "cutoff=%{x:.3f}<extra></extra>",
+                visible = FALSE)
+  
+
+    # Add GMM density curves if applicable
+    if (is_gmm_valid(i)) {
+
+      means <- thr_valid$GMM2_means[[i]]
+      sds <- thr_valid$GMM2_sds[[i]]
+      weights <- thr_valid$GMM2_weights[[i]]
+
+      x_seq <- seq(min(df$x), max(df$x), length.out = 300)
+      bin_width <- mean(diff(local_breaks))
+      scaler <- nrow(df) * bin_width  # scale density to count space
+      
+      gmm_line_colors <- if (direction == "low") {
+        c("#a80000", "#107c10")
+      } else {
+        c("#107c10", "#a80000")
+      }      
+      
+      gmm_colors <- if (direction == "low") {
+        c("rgba(168, 0, 0,0.25)", "rgba(16, 124, 16,0.25)")
+      } else {
+        c("rgba(16,124,16,0.25)", "rgba(168, 0, 0,0.25)")
+      }
+      
+      for (k in 1:2) {
+        dens <- weights[k] * dnorm(x_seq, mean = means[k], sd = sds[k]) * scaler
+        fig <- fig |>
+          add_trace(x = x_seq,
+                    y = dens,
+                    type = "scatter",
+                    mode = "lines",
+                    fill = "tozeroy",
+                    fillcolor = gmm_colors[k],
+                    line = list(color = gmm_line_colors[k],
+                                width = 2,
+                                dash = "solid"),
+                    name = paste0("GMM comp.", k,
+                                  " (μ=", round(means[k], 3),
+                                  ", σ=", round(sds[k], 3), ")"),
+                    hoverinfo = "skip",
+                    visible = FALSE)
+      }
+    }
+
+    # Build visibility vector for this method
+    # vis <- rep(FALSE, n_total)
+    # start <- trace_starts[i]
+    # vis[start:(start + n_traces_per_method[i] - 1)] <- TRUE
+    # visibility[[i + 1]] <- vis
+    vis <- rep(FALSE, n_total)
+    vis[2] <- TRUE
+    start <- trace_starts[i]
+    vis[start:(start + n_traces_per_method[i] - 1)] <- TRUE
+    visibility[[i + 1]] <- vis
+  }
+
+  # ---- Dropdown menu
+  labels <- c("All thresholds", sapply(seq_len(nrow(thr_valid)), function(i) {
+    thr <- thr_valid$threshold[i]
+    flagged <- if (direction == "low") df$x < thr else df$x > thr
+    pct <- round(100 * mean(flagged), 1)
+    paste0(thr_valid$method[i], " (", pct, "% flagged)")
+  }))
+
+  buttons <- lapply(seq_along(labels), function(i) {
+    list(method = "update",
+         args= list(list(visible = visibility[[i]])),
+         label = labels[i])
+  })
+
+  # ---- Layout
+  fig <- fig |>
+    layout(title = list(text = paste0(metric_name, ": QC threshold explorer")),
+           barmode = "stack",  plot_bgcolor = "white", paper_bgcolor = "white",
+           xaxis  = list(title = metric_name, gridcolor = "#e5e5e5"), yaxis = list(title = "Count",gridcolor = "#e5e5e5"),
+           legend = list(orientation = "v", x = 1.02, y = 1, xanchor = "left"),
+           updatemenus = list(list(type = "dropdown",
+                                   buttons = buttons,
+                                   x = 0,y = 1.15)))
+
+  fig
+}
+
+###########################################################################################################
+###########################################################################################################
+
+# --- Create function to run the main pipeline, preventing copy paste each time
+explore_thresholds <- function(dataset,
+                               metrics,
+                               id_var = "code",
+                               direction = c("low", "high"),
+                               metric_names = NULL,
+                               exclude_methods = NULL,
+                               nbins = 80,
+                               save_dir = NULL,
+                               file_names= NULL) {
+
+  direction <- match.arg(direction)
+
+  if (is.null(metric_names)) metric_names <- metrics
+  if (!is.null(save_dir)) {
+    if (is.null(file_names)) file_names <- paste0(metrics, ".html")
+    dir.create(save_dir, showWarnings = FALSE, recursive = TRUE)
+  }
+
+  compute_fn <- if (direction == "low") compute_thresholds_low_bad else compute_thresholds_high_bad
+
+  plots <- lapply(seq_along(metrics), function(i) {
+
+    metric <- metrics[i]
+    mname <- metric_names[i]
+    x <- dataset[[metric]]
+    n <- sum(!is.na(x))
+
+    thr <- suppressWarnings(compute_fn(x)) |>
+      mutate(flags_n = sapply(threshold, function(t) {
+        if (direction == "low") sum(x < t, na.rm = TRUE) else sum(x > t, na.rm = TRUE)
+        }),
+        flags_pct = round(100 * flags_n / n, 1))
+
+    if (!is.null(exclude_methods))
+      thr <- thr |> filter(!grepl(paste(exclude_methods, collapse = "|"), method))
+
+    p <- plot_thresholds_interactive(dataset = dataset,
+                                     metric = metric,
+                                     id_var = id_var,
+                                     df_thresholds = thr,
+                                     direction = direction,
+                                     nbins=nbins,
+                                     metric_name= mname)
+
+    if (!is.null(save_dir))
+      htmlwidgets::saveWidget(p, file.path(save_dir, file_names[i]))
+
+    p
+  })
+
+  names(plots) <- metrics
+  invisible(plots)
+}
+
+```
+
+
+## Generate interactive plots
+```{r}
+
+
+################# ----------------------- A4-LEARN ----------------------- #################
+############################################################################################
+
+# lower is worse
+explore_thresholds(dataset = qc_metrics_a4,
+                   metrics = c("dice_coreg", "nmi_coreg", "nmi_norm"),
+                   direction = "low",
+                   metric_names = c("Dice index (anat/func masks)", 
+                                    "T1w-EPI normalized mutual info (masked)",
+                                    "T1w-MNI normalized mutual info (masked)"), 
+                   exclude_methods = "percentile",
+                   nbins = 80,
+                   save_dir = "interactive-plots/a4",
+                   file_names = c("thrs_dice-coreg_a4.html", "thrs_masked-nmi-coreg_a4.html", "thrs_masked-nmi-norm_a4.html"))
+
+# higher is worse
+explore_thresholds(dataset = qc_metrics_a4,
+                   metrics = "dropout_score",
+                   direction = "high",
+                   metric_names = "Dropout score", 
+                   exclude_methods = "percentile",
+                   nbins = 80,
+                   save_dir = "interactive-plots/a4",
+                   file_names = "thrs_dropout_a4.html")
+
+
+################# ----------------------- Rosmap ----------------------- #################
+############################################################################################
+
+# lower is worse
+explore_thresholds(dataset = qc_metrics_rosmap,
+                   metrics = c("dice_coreg", "nmi_coreg", "nmi_norm"),
+                   direction = "low",
+                   metric_names = c("Dice index (anat/func masks)", 
+                                    "T1w-EPI normalized mutual info (masked)",
+                                    "T1w-MNI normalized mutual info (masked)"), 
+                   exclude_methods = "percentile",
+                   nbins = 80,
+                   save_dir = "interactive-plots/rosmap",
+                   file_names = c("thrs_dice-coreg_rosmap.html", "thrs_masked-nmi-coreg_rosmap.html", "thrs_masked-nmi-norm_rosmap.html"))
+
+# higher is worse
+explore_thresholds(dataset = qc_metrics_rosmap,
+                   metrics = "dropout_score",
+                   direction = "high",
+                   metric_names = "Dropout score", 
+                   exclude_methods = "percentile",
+                   nbins = 80,
+                   save_dir = "interactive-plots/rosmap",
+                   file_names = "thrs_dropout_rosmap.html")
+
+################# ----------------------- Vallecas ----------------------- #################
+############################################################################################
+
+# lower is worse
+explore_thresholds(dataset = qc_metrics_vallecas,
+                   metrics = c("dice_coreg", "nmi_coreg", "nmi_norm"),
+                   direction = "low",
+                   metric_names = c("Dice index (anat/func masks)", 
+                                    "T1w-EPI normalized mutual info (masked)",
+                                    "T1w-MNI normalized mutual info (masked)"), 
+                   exclude_methods = "percentile",
+                   nbins = 80,
+                   save_dir = "interactive-plots/vallecas",
+                   file_names = c("thrs_dice-coreg_vallecas.html", "thrs_masked-nmi-coreg_vallecas.html", "thrs_masked-nmi-norm_vallecas.html"))
+
+# higher is worse
+explore_thresholds(dataset = qc_metrics_vallecas,
+                   metrics = "dropout_score",
+                   direction = "high",
+                   metric_names = "Dropout score", 
+                   exclude_methods = "percentile",
+                   nbins = 80,
+                   save_dir = "interactive-plots/vallecas",
+                   file_names = "thrs_dropout_vallecas.html")
+
+```
+
+## Get average threshold
+```{r}
+
+
+# -- Define functions:
+# ----- Compute average threshold
+get_avg_threshold <- function(df, metrics, direction) {
+  if (direction == "low") {
+    thresh_fn <- compute_thresholds_low_bad
+  } else if (direction == "high") {
+    thresh_fn <- compute_thresholds_high_bad
+  } else {
+    stop("direction must be low or high")
+  }
+  
+  purrr::map_dfr(metrics, function(metric) {
+    df[[metric]] |>
+      thresh_fn() |>
+      filter(!grepl("percentile", method)) |>
+      summarise(avg_thresh = mean(threshold)) |>
+      mutate(metric = metric, direction = direction, .before = 1)
+  })
+}
+
+# ----- Plot
+plot_hist_thres <- function(df_data, metrics, bins = 40, df_thr) {
+  purrr::map(metrics, function(var) {
+    df_data |>
+      ggplot(aes(x = .data[[var]])) +
+      geom_histogram(color = "white", bins = bins, alpha = 0.6) +
+      geom_rug(alpha = 0.8, color = "deepskyblue4") +
+      geom_vline(data = df_thr |> filter(metric== var), aes(xintercept = avg_thresh), linetype=1, linewidth=0.5, color="red2") +
+      geom_label(data = df_thr |> filter(metric == var), mapping = aes(x = avg_thresh, label = round(avg_thresh, 3), color = "red2"),
+        y = Inf, vjust = 2, hjust = -0.1, size = 3.5, show.legend = FALSE,
+        label.size = NA, fill = scales::alpha("white", 0.6)) +
+      # geom_text(data = df_thr |> filter(metric == var), mapping = aes(x = avg_thresh, label = paste0("avg = ",round(avg_thresh, 3)), color ="red2"),
+      #           y = Inf, vjust = 1.5, hjust = -0.1, size=3.5, show.legend = FALSE) +
+      theme(strip.background = element_rect(fill = "grey30"), strip.text= element_text(colour = "white")) +
+      labs(x = var)
+  })
+}
+
+################# ----------------------- A4-LEARN ----------------------- #################
+############################################################################################
+
+# lower is worse
+avg_thres_low <- get_avg_threshold(df= qc_metrics_a4, metrics = c("dice_coreg", "nmi_coreg", "nmi_norm"), direction ="low")
+
+# higher is worse
+avg_thres_high <- get_avg_threshold(df= qc_metrics_a4, metrics = "dropout_score", direction ="high")
+
+avg_thres_a4 <- bind_rows(avg_thres_low, avg_thres_high)
+rm(avg_thres_low, avg_thres_high)
+
+write_csv(avg_thres_a4, "inputs/quality_metrics/avg_thres_a4.csv")
+
+# -- plot
+h <- plot_hist_thres(df_data= qc_metrics_a4, metrics = c("dice_coreg", "nmi_coreg", "nmi_norm", "dropout_score"), df_thr=avg_thres_a4)
+patchwork::wrap_plots(h)
+
+################# ----------------------- Rosmap ----------------------- #################
+############################################################################################
+
+# lower is worse
+avg_thres_low <- get_avg_threshold(df= qc_metrics_rosmap, metrics = c("dice_coreg", "nmi_coreg", "nmi_norm"), direction ="low")
+
+# higher is worse
+avg_thres_high <- get_avg_threshold(df= qc_metrics_rosmap, metrics = "dropout_score", direction ="high")
+
+avg_thres_rosmap <- bind_rows(avg_thres_low, avg_thres_high)
+rm(avg_thres_low, avg_thres_high)
+write_csv(avg_thres_rosmap, "inputs/quality_metrics/avg_thres_rosmap.csv")
+
+# -- plot
+h <- plot_hist_thres(df_data= qc_metrics_rosmap, metrics = c("dice_coreg", "nmi_coreg", "nmi_norm", "dropout_score"), df_thr=avg_thres_rosmap)
+patchwork::wrap_plots(h)
+
+################# ----------------------- Vallecas ----------------------- #################
+############################################################################################
+
+# lower is worse
+avg_thres_low <- get_avg_threshold(df= qc_metrics_vallecas, metrics = c("dice_coreg", "nmi_coreg", "nmi_norm"), direction ="low")
+
+# higher is worse
+avg_thres_high <- get_avg_threshold(df= qc_metrics_vallecas, metrics = "dropout_score", direction ="high")
+
+avg_thres_vallecas <- bind_rows(avg_thres_low, avg_thres_high)
+rm(avg_thres_low, avg_thres_high)
+write_csv(avg_thres_vallecas, "inputs/quality_metrics/avg_thres_vallecas.csv")
+
+# -- plot
+h <- plot_hist_thres(df_data= qc_metrics_vallecas, metrics = c("dice_coreg", "nmi_coreg", "nmi_norm", "dropout_score"), df_thr=avg_thres_vallecas)
+patchwork::wrap_plots(h)
+
+```
+
+# Pairplot
+## A4
+```{r}
+
+library(GGally)
+
+# -- Config some settings for later use
+vr_levels  <- c("Fail", "Flag", "Pass", NA) 
+viridis_opts <- list(discrete = TRUE, option = "D", end = 0.8, begin = 0.2)
+alpha_na <- function(levels, base = 1, na_alpha = 0.25) {
+  ifelse(is.na(levels) | levels == "NA", na_alpha, base)
+}
+
+# -- Whole sample histogram for numerical variables
+p_hist_num_1 <- function(data, mapping, ...) {
+  ggplot(data, mapping) +
+    geom_histogram(aes(y = after_stat(density)),
+                   bins = 30, fill = "grey20", colour = "grey80") +
+    geom_density(colour = "deepskyblue4", linewidth = 0.5) +
+    theme_bw(base_size = 7)
+}
+
+# -- Histogram for numerical variables divided per categories 
+## 2 categories
+p_hist_num_2 <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x) 
+  y_name <- rlang::as_name(mapping$y) 
+
+  data |> 
+    filter(!is.na(.data[[y_name]])) |> 
+    ggplot(aes(x = .data[[x_name]], fill = .data[[y_name]])) +
+    geom_histogram(bins = 25, colour = "white", position = "identity", alpha= 0.7) +
+    paletteer::scale_fill_paletteer_d("nbapalettes::sixers_retro") +
+    theme_bw(base_size = 7)
+}
+
+## 3 categories
+p_hist_num_3 <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x) 
+  y_name <- rlang::as_name(mapping$y) 
+
+  data |> 
+    filter(!is.na(.data[[y_name]])) |> 
+    ggplot(aes(x = .data[[x_name]], fill = .data[[y_name]]))  +
+    geom_histogram(bins = 25, colour = "white", position = "identity", alpha= 0.7) +
+    paletteer::scale_fill_paletteer_d("ltc::trio1") +
+    theme_bw(base_size = 7)
+}
+
+# -- Logistic regression plot
+p_logist <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y) # metric
+
+  data |>
+    filter(!is.na(.data[[x_name]])) |>
+    mutate(lv = case_when(
+      .data[[x_name]] == "Pass" ~ 1L,
+      .data[[x_name]] %in% c("Flag", "Fail") ~ 0L
+    )) |>
+    ggplot(aes(x = .data[[y_name]], y = lv)) +
+    geom_point(alpha = 0.3) +
+    stat_smooth(method = "glm", se = TRUE,
+                method.args = list(family = binomial),
+                col = "deepskyblue4") +
+    theme_bw(base_size = 7) +
+    labs(y = x_name)
+}
+
+# -- Jitter age visual ratings
+p_jitter_vr <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |> 
+    filter(!is.na(.data[[x_name]]))
+  
+  d |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], fill = .data[[x_name]], color = .data[[x_name]])) +
+    scale_colour_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    scale_fill_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    geom_jitter(alpha= 0.8, width=0.1) +
+    stat_summary(fun = mean, geom = "label",
+                 aes(label = round(after_stat(y), 1)),
+                 fill = "#750985", color = "white", size = 2,label.size = 0) +
+    theme_bw(base_size = 7) 
+}
+
+
+# -- Violin visual ratings
+p_violin_vr <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |> 
+    filter(!is.na(.data[[y_name]]))
+  
+  d |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], fill = .data[[y_name]])) +
+    scale_colour_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    scale_fill_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    geom_violin(alpha= 0.8, colour="white") +
+    geom_boxplot(width=0.1, colour="white") +
+    theme_bw(base_size = 7) 
+}
+
+# -- Boxplot visual ratings
+p_boxplot_vr <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |> 
+    filter(!is.na(.data[[y_name]]))
+  
+  d |> ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], colour = .data[[y_name]])) +
+    scale_colour_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    geom_violin(colour = "white", fill = "white") +
+    geom_boxplot(outlier.colour = NA) +
+    geom_jitter(alpha = 0.15) +
+    theme_bw(base_size = 7) 
+}
+
+# -- Bar plot with N 
+# 2 categories 
+p_bar_count_2 <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+
+  data |> 
+    filter(!is.na(.data[[x_name]])) |> 
+    ggplot(aes(x = .data[[x_name]], fill = .data[[x_name]])) +
+    geom_bar() +
+    geom_text(stat = "count",
+              aes(label = paste0("n = ", after_stat(count))),
+              vjust = -0.3, size = 2) +
+    scale_fill_viridis(discrete = TRUE, option = "D", end = 0.8, begin = 0.2,
+                       guide = "none") +
+    paletteer::scale_fill_paletteer_d("nbapalettes::sixers_retro") +
+    theme_bw(base_size = 7) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          axis.title  = element_blank()) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20)))
+}
+
+# 3 categories 
+p_bar_count_3 <- function(data, mapping, ...) {
+  x_name  <- rlang::as_name(mapping$x)
+
+  data |> 
+    filter(!is.na(.data[[x_name]])) |> 
+    ggplot(aes(x = .data[[x_name]], fill = .data[[x_name]])) +
+    geom_bar() +
+    geom_text(stat = "count",
+              aes(label = paste0("n = ", after_stat(count))),
+              vjust = -0.3, size = 2) +
+    paletteer::scale_fill_paletteer_d("ltc::trio1") +
+    theme_bw(base_size = 7) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          axis.title  = element_blank()) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20)))
+}
+
+# vr 
+p_bar_count_vr <- function(data, mapping, ...) {
+  x_name  <- rlang::as_name(mapping$x)
+  data |> filter(!is.na(.data[[x_name]])) |> 
+    ggplot(aes(x = .data[[x_name]], fill = .data[[x_name]])) +
+    geom_bar() +
+    geom_text(stat = "count",
+              aes(label = paste0("n = ", after_stat(count))),
+              vjust = -0.3, size = 2) +
+    scale_fill_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2) +
+    theme_bw(base_size = 7) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          axis.title  = element_blank()) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20)))
+}
+
+# -- Boxplot with par category 
+# 2 categories 
+p_boxplot_2 <- function(data, mapping, site_var = NULL, ...) {
+  
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |> 
+    filter(!is.na(.data[[x_name]]))
+  
+  # add stats
+  predictors <- c(x_name, "age")
+  if (!is.null(site_var)) predictors <- c(predictors, site_var)
+  m_formula <- as.formula(paste(y_name,"~", paste(predictors, collapse = " + "), "+ (1|subject)"))
+
+  m<- lmerTest::lmer(m_formula, data = d)
+  emm_formula <- as.formula(paste("pairwise ~", x_name))
+  temp <- emmeans::emmeans(m, emm_formula)$contrast |> as.data.frame()
+  t_val <- round(temp[, "t.ratio"], 2)
+  t_p <- format_pval_star(temp[, "p.value"])
+
+  label_txt <- paste0("t = ", t_val, t_p)
+  
+  y_max <- max(d[[y_name]], na.rm = TRUE)
+  y_min <- min(d[[y_name]], na.rm = TRUE)
+  y_range <- y_max - y_min
+  seg_y  <- y_max + 0.08 * y_range
+  text_y <- y_max + 0.14 * y_range
+  
+  d |> ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], color = .data[[x_name]])) +
+    geom_boxplot(outlier.size = 0.4, outlier.alpha = 0.5) +
+    paletteer::scale_color_paletteer_d("nbapalettes::sixers_retro") +
+    theme_bw(base_size = 7) +
+    theme(axis.title.x = element_blank(),
+          axis.text.x  = element_text(angle = 30, hjust = 1)) +
+    annotate("segment", x=1, xend=2, y=seg_y, yend=seg_y, linewidth=0.3) +
+    annotate("text", x=1.5, y=text_y, label = label_txt, size=2, vjust= 0) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20)))
+}
+
+# 3 categories 
+p_boxplot_3 <- function(data, mapping, ...) {
+  
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |> 
+    filter(!is.na(.data[[x_name]]))
+  
+  # add stats
+  predictors <- c(x_name, "age", "sex")
+  m_formula <- as.formula(paste(y_name,"~", paste(predictors, collapse = " + "), "+ (1|subject)"))
+
+  m<- lmerTest::lmer(m_formula, data = d)
+  emm_formula <- as.formula(paste("pairwise ~", x_name))
+  temp <- emmeans::emmeans(m, emm_formula)$contrast |> as.data.frame()
+  contrasts_split <- strsplit(temp$contrast, " - ")
+
+  temp$x1 <- sapply(contrasts_split, `[`, 1)
+  temp$x2 <- sapply(contrasts_split, `[`, 2)
+  lvls <- levels(factor(d[[x_name]]))
+  temp$xstart <- match(temp$x1, lvls)
+  temp$xend <- match(temp$x2, lvls)
+
+  temp$label <- paste0("t = ", round(temp$t.ratio, 2),format_pval_star(temp$p.value))
+
+  y_max <- max(d[[y_name]], na.rm = TRUE)
+  y_min <- min(d[[y_name]], na.rm = TRUE)
+  y_range <- y_max - y_min
+
+  temp$seg_y <- y_max + seq_len(nrow(temp)) * 0.7 * y_range
+  temp$text_y <- temp$seg_y + 0.1 * y_range
+  
+  d |> ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], color = .data[[x_name]])) +
+    geom_boxplot(outlier.size = 0.4, outlier.alpha = 0.5) +
+    paletteer::scale_color_paletteer_d("ltc::trio1") +
+    geom_segment(data=temp, aes(x=xstart, xend=xend, y=seg_y, yend = seg_y), linewidth=0.3, inherit.aes=FALSE) +
+    geom_text(data=temp, aes(x=(xstart+xend)/2, y=text_y, label=label), size = 2, inherit.aes=FALSE, vjust=0) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20))) +
+    theme_bw(base_size = 7) +
+    theme(axis.title.x = element_blank(),
+          axis.text.x  = element_text(angle = 30, hjust = 1))
+}
+
+# -- Square plot with N 
+p_square <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]])) |> 
+    count(.data[[x_name]], .data[[y_name]]) |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]])) +
+    geom_point(aes(size = n), shape = 15, show.legend = FALSE, color="grey20") +
+    geom_label(aes(label = paste0("n = ",n)), fill="grey20", size=2, label.size=0, color="white") +
+    scale_size_area(max_size = 7) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30, hjust = 1))
+}
+
+p_square_2 <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]])) |> 
+    count(.data[[x_name]], .data[[y_name]]) |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], color = .data[[x_name]])) +
+    geom_point(aes(size = n), shape = 15, show.legend = FALSE) +
+    scale_color_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2) +
+    # new_scale_color() +
+    # geom_text(aes(label = n, color = .data[[y_name]])) +
+    geom_label(aes(label = paste0("n = ",n), fill= .data[[y_name]]), size=2, label.size=0, color="white") +
+    paletteer::scale_fill_paletteer_d("nbapalettes::sixers_retro") +
+    scale_size_area(max_size = 10) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30, hjust = 1))
+}
+
+p_square_3 <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]])) |> 
+    count(.data[[x_name]], .data[[y_name]]) |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], color = .data[[x_name]])) +
+    geom_point(aes(size = n), shape = 15, show.legend = FALSE) +
+    scale_color_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2) +
+    geom_label(aes(label = paste0("n = ",n), fill= .data[[y_name]]), size=2, label.size=0, color="white") +
+    paletteer::scale_fill_paletteer_d("ltc::trio1") +
+    scale_size_area(max_size = 10) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30, hjust = 1))
+}
+
+# -- Bar plot percentage
+p_colbar_vr <- function(data, mapping, ...) {
+
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]]))
+
+  d |> ggplot(aes(x = .data[[x_name]], fill = .data[[y_name]])) +
+    geom_bar(position = "fill", colour = "white", linewidth = 0.2) +
+    geom_text(stat = "count", position = position_fill(vjust = 0.5), 
+              aes(label = ifelse(after_stat(count / ave(count, x, FUN = sum)) > 0.10, 
+                                 scales::percent(after_stat(count / ave(count, x, FUN = sum)), accuracy = 1),"")),
+              colour = "white",size = 2) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30,hjust = 1), 
+          legend.position = "none",
+          panel.grid = element_blank()) +
+    scale_fill_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") 
+}
+
+## manufacturer en x
+p_colbar_2 <- function(data, mapping, ...) {
+
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]]))
+
+  d |> ggplot(aes(x = .data[[x_name]], fill = .data[[y_name]])) +
+    geom_bar(position = "fill", colour = "white", linewidth = 0.2) +
+    geom_text(stat = "count", position = position_fill(vjust = 0.5), 
+              aes(label = ifelse(after_stat(count / ave(count, x, FUN = sum)) > 0.10, 
+                                 scales::percent(after_stat(count / ave(count, x, FUN = sum)), accuracy = 1),"")),
+              colour = "white",size = 2) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30,hjust = 1), 
+          legend.position = "none",
+          panel.grid = element_blank()) +
+    paletteer::scale_fill_paletteer_d("nbapalettes::sixers_retro")
+}
+
+## sex en x
+p_colbar_3 <- function(data, mapping, ...) {
+
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]]))
+
+  d |> ggplot(aes(x = .data[[x_name]], fill = .data[[y_name]])) +
+    geom_bar(position = "fill", colour = "white", linewidth = 0.2) +
+    geom_text(stat = "count", position = position_fill(vjust = 0.5), 
+              aes(label = ifelse(after_stat(count / ave(count, x, FUN = sum)) > 0.10, 
+                                 scales::percent(after_stat(count / ave(count, x, FUN = sum)), accuracy = 1),"")),
+              colour = "white",size = 2) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30,hjust = 1), 
+          legend.position = "none",
+          panel.grid = element_blank()) +
+    paletteer::scale_fill_paletteer_d("ltc::trio1")
+}
+
+# -- Scatter plots
+## between metrics
+p_scatter_metric <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+  
+  ggplot(data, mapping) +
+    geom_point(alpha = 0.25, size = 0.7, colour = "grey20") +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 0.7, colour = "#fd6a00") +
+    theme_bw(base_size = 7)
+}
+
+## with age
+p_scatter_age <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+  
+  ggplot(data, mapping) +
+    geom_point(alpha = 0.25, size = 0.7, colour = "grey20") +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 0.7, colour = "#750985") +
+    theme_bw(base_size = 7)
+}
+
+# Format p-values
+format_pval <- function(p) {
+  dplyr::case_when(p < 0.001 ~ "p < 0.001***",
+                   p < 0.01 ~ paste0("p = ", round(p, 3), "**"),
+                   p < 0.05 ~ paste0("p = ", round(p, 3), "*"),
+                   TRUE ~ paste0("p = ", round(p, 3)))
+}
+
+format_pval_star <- function(p) {
+  dplyr::case_when(p < 0.001 ~ "***",
+                   p < 0.01 ~ "**",
+                   p < 0.05 ~ "*",
+                   TRUE ~ "")
+}
+
+# -- Correlation coef
+p_cor_text <- function(data, mapping, method = c("pearson", "kendall", "spearman"), ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  corr <- cor.test(data[[x_name]], data[[y_name]], use = "complete.obs", method = method)
+  r <- round(corr$estimate, 2)
+  sym <- if (method == "kendall") "τ" else "r"
+
+  p_lab <- format_pval(corr$p.value)
+  method_lab <- case_when(method=="pearson" ~ "Pearson",
+                          method=="kendall" ~ "Kendall",
+                          method=="spearman" ~ "Spearman")
+
+  ggplot(data, mapping) +
+    geom_blank() +
+    annotate("text",x= mean(range(data[[x_name]], na.rm = TRUE)),
+             y= mean(range(data[[y_name]], na.rm = TRUE)),
+             label = paste0(method_lab, ":\n",sym, " = ", r, "\n", p_lab),
+             size = 2.5,
+             colour = "#fd6a00") +
+    theme_bw(base_size = 7) +
+    theme(axis.text  = element_blank(),
+          axis.ticks = element_blank(),
+          panel.grid = element_blank())
+}
+
+## pearson or kendall
+p_cor_p <- function(data, mapping, ...) p_cor_text(data, mapping, method = "pearson",  ...)
+p_cor_s <- function(data, mapping, ...) p_cor_text(data, mapping, method = "spearman",  ...)
+p_cor_t <- function(data, mapping, ...) p_cor_text(data, mapping, method = "kendall", ...)
+
+
+# -- Logistic glm (x= metric, y= vr)
+p_logist_text <- function(data, mapping, site_var = NULL, ...) {
+  x_name <- rlang::as_name(mapping$x) 
+  y_name <- rlang::as_name(mapping$y)
+  
+  df <- data |> filter(!is.na(.data[[x_name]]))
+
+  # kendall τ between metric and visual ratings
+  y_num <- as.numeric(df[[x_name]])
+  kt <- cor.test(df[[y_name]], y_num, use = "complete.obs", method = "kendall")
+
+  tau <- round(kt$estimate, 2)
+  tau_p <- format_pval_star(kt$p.value)
+
+  # glm
+  df_glm <- df |>
+    mutate(.fail = case_when(.data[[x_name]] == "Pass" ~ 1L,
+                             .data[[x_name]] %in% c("Flag", "Fail") ~ 0L)) |>
+    filter(!is.na(.fail))
+
+  predictors <- c(y_name, "vis_qc_rater")
+  if (!is.null(site_var)) predictors <- c(predictors, site_var)
+  m_formula <- as.formula(paste(".fail ~", paste(predictors, collapse = " + ")))
+
+  m<- glm(m_formula, family = "binomial", data = df_glm)
+  stat_term <- summary(m)$coefficients[y_name, , drop = FALSE]
+  z_val <- round(stat_term[, "z value"], 2)
+  z_p <- format_pval_star(stat_term[, "Pr(>|z|)"])
+
+  # Prepare text for plot
+  label_txt <- paste0("Kendall:\n τ =", tau, tau_p, "\nGLM:\nZ = ", z_val, z_p)
+
+  data |> 
+    # filter(!is.na(.data[[y_name]])) |> 
+    ggplot(mapping) +
+    geom_blank() +
+    annotate("text", 
+             x= 0.5,
+             y = 0.5,
+             label = label_txt,
+             size = 2.5,
+             colour = "deepskyblue4") +
+    theme_bw(base_size = 7) +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(), panel.grid = element_blank()) +
+    coord_cartesian(xlim = c(0,1), ylim = c(0,1))
+}
+
+# Regression age
+p_lmer_num_text <- function(data, mapping, site_var = NULL, ...) {
+  x_name <- rlang::as_name(mapping$x) 
+  y_name <- rlang::as_name(mapping$y)
+
+  predictors <- c(x_name, "sex")
+  if (!is.null(site_var)) predictors <- c(predictors, site_var)
+  m_formula <- as.formula(paste(y_name,"~", paste(predictors, collapse = " + "), "+ (1|subject)"))
+
+  m<- lmerTest::lmer(m_formula, data = data)
+  stat_term <- summary(m)$coefficients[x_name, , drop = FALSE]
+  t_val <- round(stat_term[, "t value"], 2)
+  t_p <- format_pval(stat_term[, "Pr(>|t|)"])
+
+  # Prepare text for plot
+  label_txt <- paste0("LMM:\nt = ", t_val, "\n", t_p)
+
+  ggplot(data, mapping) +
+    geom_blank() +
+    annotate("text", 
+             x= mean(range(data[[x_name]], na.rm = TRUE)),
+             y = mean(range(data[[y_name]], na.rm = TRUE)),
+             label = label_txt,
+             size = 2.5,
+             colour = "#750985") +
+    theme_bw(base_size = 7) +
+    theme(axis.text  = element_blank(), axis.ticks = element_blank(), panel.grid = element_blank())
+}
+
+p_logist_text_nosite <- function(data, mapping, ...) {
+  p_logist_text(data, mapping, site_var = NULL, ...)
+}
+p_logist_text_site <- function(data, mapping, ...) {
+  p_logist_text(data, mapping, site_var = "scanner_manufacturer", ...)
+}
+
+
+# -- Make router
+
+metric_vars <- c("fd", "dice_coreg", "nmi_coreg", "dropout_score", "nmi_norm")
+num_vars <- c("age")
+sex <- "sex"
+site <- "scanner_manufacturer"
+vr_vars  <- c("vr_coreg", "vr_dropout")
+
+
+make_router_lower <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  x_metric <- x_name %in% metric_vars
+  x_num <- x_name %in% num_vars
+  x_sex <- x_name == sex
+  x_site <- x_name == site
+  x_vr <- x_name %in% vr_vars
+  y_metric <- y_name %in% metric_vars
+  y_num <- y_name %in% num_vars
+  y_sex <- y_name == sex
+  y_site <- y_name == site
+  y_vr <- y_name %in% vr_vars
+
+  if (x_metric && y_metric) p_scatter_metric(data, mapping, ...)
+  else if (x_metric && y_num) p_scatter_age(data, mapping, ...)
+  else if (x_metric && y_sex) p_hist_num_2(data, mapping, ...)
+  else if (x_num && y_sex) p_hist_num_2(data, mapping, ...)
+  else if (x_num && y_site) p_hist_num_3(data, mapping, ...)
+  else if (x_metric && y_site) p_hist_num_3(data, mapping, ...)
+  else if (x_metric && y_vr) p_boxplot_vr(data, mapping, ...)
+  else if (x_num && y_vr) p_violin_vr(data, mapping, ...)
+  else if (x_vr && y_vr) p_colbar_vr(data, mapping, ...)
+  else if (y_site && x_sex) p_colbar_3(data, mapping, ...)
+  else if (x_site && y_vr) p_colbar_vr(data, mapping, ...)
+  else if (x_sex && y_vr) p_colbar_vr(data, mapping, ...)
+  else ggally_blank()
+}
+
+make_router_upper <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  x_metric <- x_name %in% metric_vars
+  x_num <- x_name %in% num_vars
+  x_sex <- x_name == sex
+  x_site <- x_name == site
+  x_vr <- x_name %in% vr_vars
+  y_metric <- y_name %in% metric_vars
+  y_num <- y_name %in% num_vars
+  y_sex <- y_name == sex
+  y_site <- y_name == site
+  y_vr <- y_name %in% vr_vars
+
+  if (x_metric && y_metric)  p_cor_p(data, mapping, ...)
+  else if (x_num && y_metric)  p_lmer_num_text(data, mapping, ...)
+  else if (x_sex && y_metric) p_boxplot_2(data, mapping, ...)
+  else if (x_sex && y_num) p_boxplot_2(data, mapping, ...)
+  else if (x_site && y_metric) p_boxplot_3(data, mapping, ...)
+  else if (x_site && y_num) p_boxplot_3(data, mapping, ...)
+  else if (y_metric && x_vr) p_logist_text_site(data, mapping)  
+  else if (y_site && x_vr) p_square_3(data, mapping, ...)
+  else if (y_sex && x_vr) p_square_2(data, mapping, ...)
+  else if (y_vr && x_vr) p_square(data, mapping, ...)
+  else if (x_site && y_sex) p_colbar_2(data, mapping, ...)
+  else if (y_num && x_vr) p_jitter_vr(data, mapping, ...)
+  else ggally_blank()
+}
+
+
+make_diag <- function(data, mapping, ...) {
+  nm <- rlang::as_name(mapping$x)
+  if (nm %in% num_vars) p_hist_num_1(data, mapping, ...)
+  else if (nm %in% metric_vars) p_hist_num_1(data, mapping, ...)
+  else if (nm == sex) p_bar_count_2(data, mapping, ...)
+  else if (nm == site) p_bar_count_3(data, mapping, ...)
+  else if (nm %in% vr_vars) p_bar_count_vr(data, mapping, ...)
+}
+
+# -- Prepare data
+vars_order <- c(metric_vars,num_vars, sex, site, vr_vars)
+
+df.plot <- data_a4 |>
+  select(all_of(vars_order), vis_qc_rater, subject) |>
+  mutate_if(is.character, as.factor)
+
+# -- Plot
+p <- df.plot |>
+  ggpairs(columns = vars_order,
+    lower = list(continuous = make_router_lower, combo = make_router_lower, discrete = make_router_lower),
+    upper = list(continuous = make_router_upper, combo = make_router_upper, discrete = make_router_upper),
+    diag = list(continuous = make_diag, discrete = make_diag,na = ggally_blank),
+    progress = FALSE) +
+  theme_bw(base_size = 8) +
+  theme(strip.text = element_text(size = 6,colour="black"), strip.background =element_rect(fill="grey80"),
+        # axis.text.x = element_text(angle = 45, hjust = 1), axis.text.y = element_text(angle = 45, hjust = 1),
+        panel.spacing = unit(0.5, "lines"))
+
+print(p)
+
+ggsave(filename = "pairplot_a4.svg", plot = p, device = svg(), path = "plots/", height = 9, width = 14)
+dev.off()
+
+```
+
+## Rosmap
+```{r}
+
+library(GGally)
+
+# -- Config some settings for later use
+vr_levels  <- c("Fail", "Flag", "Pass", NA) 
+viridis_opts <- list(discrete = TRUE, option = "D", end = 0.8, begin = 0.2)
+alpha_na <- function(levels, base = 1, na_alpha = 0.25) {
+  ifelse(is.na(levels) | levels == "NA", na_alpha, base)
+}
+
+# -- Whole sample histogram for numerical variables
+p_hist_num_1 <- function(data, mapping, ...) {
+  ggplot(data, mapping) +
+    geom_histogram(aes(y = after_stat(density)),
+                   bins = 30, fill = "grey20", colour = "grey80") +
+    geom_density(colour = "deepskyblue4", linewidth = 0.5) +
+    theme_bw(base_size = 7)
+}
+
+# -- Histogram for numerical variables divided per categories 
+## 2 categories
+p_hist_num_2 <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x) 
+  y_name <- rlang::as_name(mapping$y) 
+
+  data |> 
+    filter(!is.na(.data[[y_name]])) |> 
+    ggplot(aes(x = .data[[x_name]], fill = .data[[y_name]])) +
+    geom_histogram(bins = 25, colour = "white", position = "identity", alpha= 0.7) +
+    paletteer::scale_fill_paletteer_d("nbapalettes::sixers_retro") +
+    theme_bw(base_size = 7)
+}
+
+## 3 categories
+p_hist_num_3 <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x) 
+  y_name <- rlang::as_name(mapping$y) 
+
+  data |> 
+    filter(!is.na(.data[[y_name]])) |> 
+    ggplot(aes(x = .data[[x_name]], fill = .data[[y_name]]))  +
+    geom_histogram(bins = 25, colour = "white", position = "identity", alpha= 0.7) +
+    paletteer::scale_fill_paletteer_d("wesanderson::GrandBudapest2") +
+    theme_bw(base_size = 7)
+}
+
+
+# -- Jitter age visual ratings
+p_jitter_vr <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |> 
+    filter(!is.na(.data[[x_name]]))
+  
+  d |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], fill = .data[[x_name]], color = .data[[x_name]])) +
+    scale_colour_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    scale_fill_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    geom_jitter(alpha= 0.8, width=0.1) +
+    stat_summary(fun = mean, geom = "label",
+                 aes(label = round(after_stat(y), 1)),
+                 fill = "#750985", color = "white", size = 2,label.size = 0) +
+    theme_bw(base_size = 7) 
+}
+
+
+# -- Violin visual ratings
+p_violin_vr <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |> 
+    filter(!is.na(.data[[y_name]]))
+  
+  d |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], fill = .data[[y_name]])) +
+    scale_colour_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    scale_fill_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    geom_violin(alpha= 0.8, colour="white") +
+    geom_boxplot(width=0.1, colour="white") +
+    theme_bw(base_size = 7) 
+}
+
+# -- Boxplot visual ratings
+p_boxplot_vr <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |> 
+    filter(!is.na(.data[[y_name]]))
+  
+  d |> ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], colour = .data[[y_name]])) +
+    scale_colour_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    geom_violin(colour = "white", fill = "white") +
+    geom_boxplot(outlier.colour = NA) +
+    geom_jitter(alpha = 0.15) +
+    theme_bw(base_size = 7) 
+}
+
+# -- Bar plot with N 
+# 2 categories 
+p_bar_count_2 <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+
+  data |> 
+    filter(!is.na(.data[[x_name]])) |> 
+    ggplot(aes(x = .data[[x_name]], fill = .data[[x_name]])) +
+    geom_bar() +
+    geom_text(stat = "count",
+              aes(label = paste0("n = ", after_stat(count))),
+              vjust = -0.3, size = 2) +
+    scale_fill_viridis(discrete = TRUE, option = "D", end = 0.8, begin = 0.2,
+                       guide = "none") +
+    paletteer::scale_fill_paletteer_d("nbapalettes::sixers_retro") +
+    theme_bw(base_size = 7) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          axis.title  = element_blank()) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20)))
+}
+
+# 3 categories 
+p_bar_count_3 <- function(data, mapping, ...) {
+  x_name  <- rlang::as_name(mapping$x)
+
+  data |> 
+    filter(!is.na(.data[[x_name]])) |> 
+    ggplot(aes(x = .data[[x_name]], fill = .data[[x_name]])) +
+    geom_bar() +
+    geom_text(stat = "count",
+              aes(label = paste0("n = ", after_stat(count))),
+              vjust = -0.3, size = 2) +
+    paletteer::scale_fill_paletteer_d("wesanderson::GrandBudapest2") +
+    theme_bw(base_size = 7) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          axis.title  = element_blank()) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20)))
+}
+
+# vr 
+p_bar_count_vr <- function(data, mapping, ...) {
+  x_name  <- rlang::as_name(mapping$x)
+  data |> filter(!is.na(.data[[x_name]])) |> 
+    ggplot(aes(x = .data[[x_name]], fill = .data[[x_name]])) +
+    geom_bar() +
+    geom_text(stat = "count",
+              aes(label = paste0("n = ", after_stat(count))),
+              vjust = -0.3, size = 2) +
+    scale_fill_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2) +
+    theme_bw(base_size = 7) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          axis.title  = element_blank()) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20)))
+}
+
+# -- Boxplot with par category 
+# 2 categories 
+p_boxplot_2 <- function(data, mapping, site_var = NULL, ...) {
+  
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |> 
+    filter(!is.na(.data[[x_name]]))
+  
+  # add stats
+  predictors <- c(x_name, "age")
+  if (!is.null(site_var)) predictors <- c(predictors, site_var)
+  m_formula <- as.formula(paste(y_name,"~", paste(predictors, collapse = " + "), "+ (1|subject)"))
+
+  m<- lmerTest::lmer(m_formula, data = d)
+  emm_formula <- as.formula(paste("pairwise ~", x_name))
+  temp <- emmeans::emmeans(m, emm_formula)$contrast |> as.data.frame()
+  t_val <- round(temp[, "t.ratio"], 2)
+  t_p <- format_pval_star(temp[, "p.value"])
+
+  label_txt <- paste0("t = ", t_val, t_p)
+  
+  y_max <- max(d[[y_name]], na.rm = TRUE)
+  y_min <- min(d[[y_name]], na.rm = TRUE)
+  y_range <- y_max - y_min
+  seg_y  <- y_max + 0.08 * y_range
+  text_y <- y_max + 0.14 * y_range
+  
+  d |> ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], color = .data[[x_name]])) +
+    geom_boxplot(outlier.size = 0.4, outlier.alpha = 0.5) +
+    paletteer::scale_color_paletteer_d("nbapalettes::sixers_retro") +
+    theme_bw(base_size = 7) +
+    theme(axis.title.x = element_blank(),
+          axis.text.x  = element_text(angle = 30, hjust = 1)) +
+    annotate("segment", x=1, xend=2, y=seg_y, yend=seg_y, linewidth=0.3) +
+    annotate("text", x=1.5, y=text_y, label = label_txt, size=2, vjust= 0) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20)))
+}
+
+# 3 categories 
+p_boxplot_3 <- function(data, mapping, ...) {
+  
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |> 
+    filter(!is.na(.data[[x_name]]))
+  
+  # add stats
+  predictors <- c(x_name, "age", "sex")
+  m_formula <- as.formula(paste(y_name,"~", paste(predictors, collapse = " + "), "+ (1|subject)"))
+
+  m<- lmerTest::lmer(m_formula, data = d)
+  emm_formula <- as.formula(paste("pairwise ~", x_name))
+  temp <- emmeans::emmeans(m, emm_formula)$contrasts |> as.data.frame()
+  contrasts_split <- strsplit(temp$contrast, " - ")
+
+  temp$x1 <- sapply(contrasts_split, `[`, 1)
+  temp$x2 <- sapply(contrasts_split, `[`, 2)
+  lvls <- levels(factor(d[[x_name]]))
+  temp$xstart <- match(temp$x1, lvls)
+  temp$xend <- match(temp$x2, lvls)
+
+  temp$label <- paste0("t = ", round(temp$t.ratio, 2),format_pval_star(temp$p.value))
+
+  y_max <- max(d[[y_name]], na.rm = TRUE)
+  y_min <- min(d[[y_name]], na.rm = TRUE)
+  y_range <- y_max - y_min
+
+  temp$seg_y <- y_max + seq_len(nrow(temp)) * 0.7 * y_range
+  temp$text_y <- temp$seg_y + 0.1 * y_range
+  
+  d |> ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], color = .data[[x_name]])) +
+    geom_boxplot(outlier.size = 0.4, outlier.alpha = 0.5) +
+    paletteer::scale_color_paletteer_d("wesanderson::GrandBudapest2") +
+    geom_segment(data=temp, aes(x=xstart, xend=xend, y=seg_y, yend = seg_y), linewidth=0.3, inherit.aes=FALSE) +
+    geom_text(data=temp, aes(x=(xstart+xend)/2, y=text_y, label=label), size = 2, inherit.aes=FALSE, vjust=0) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20))) +
+    theme_bw(base_size = 7) +
+    theme(axis.title.x = element_blank(),
+          axis.text.x  = element_text(angle = 30, hjust = 1))
+}
+
+# -- Square plot with N 
+p_square <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]])) |> 
+    count(.data[[x_name]], .data[[y_name]]) |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]])) +
+    geom_point(aes(size = n), shape = 15, show.legend = FALSE, color="grey20") +
+    geom_label(aes(label = paste0("n = ",n)), fill="grey20", size=2, label.size=0, color="white") +
+    scale_size_area(max_size = 7) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30, hjust = 1))
+}
+
+p_square_2 <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]])) |> 
+    count(.data[[x_name]], .data[[y_name]]) |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], color = .data[[x_name]])) +
+    geom_point(aes(size = n), shape = 15, show.legend = FALSE) +
+    scale_color_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2) +
+    # new_scale_color() +
+    # geom_text(aes(label = n, color = .data[[y_name]])) +
+    geom_label(aes(label = paste0("n = ",n), fill= .data[[y_name]]), size=2, label.size=0, color="white") +
+    paletteer::scale_fill_paletteer_d("nbapalettes::sixers_retro") +
+    scale_size_area(max_size = 10) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30, hjust = 1))
+}
+
+p_square_3 <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]])) |> 
+    count(.data[[x_name]], .data[[y_name]]) |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], color = .data[[x_name]])) +
+    geom_point(aes(size = n), shape = 15, show.legend = FALSE) +
+    scale_color_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2) +
+    geom_label(aes(label = paste0("n = ",n), fill= .data[[y_name]]), size=2, label.size=0, color="black") +
+    paletteer::scale_fill_paletteer_d("wesanderson::GrandBudapest2") +
+    scale_size_area(max_size = 10) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30, hjust = 1))
+}
+
+# -- Bar plot percentage
+p_colbar_vr <- function(data, mapping, ...) {
+
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+  
+  x_levels <- levels(factor(data[[x_name]]))
+  d <- data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]])) |> 
+    mutate(!!x_name := factor(.data[[x_name]], levels = x_levels))
+
+  d |> ggplot(aes(x = .data[[x_name]], fill = .data[[y_name]])) +
+    geom_bar(position = "fill", colour = "white", linewidth = 0.2) +
+    geom_text(stat = "count", position = position_fill(vjust = 0.5), 
+              aes(label = ifelse(after_stat(count / ave(count, x, FUN = sum)) > 0.10, 
+                                 scales::percent(after_stat(count / ave(count, x, FUN = sum)), accuracy = 1),"")),
+              colour = "white",size = 2) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30,hjust = 1), 
+          legend.position = "none",
+          panel.grid = element_blank()) +
+    scale_x_discrete(drop = FALSE) +
+    scale_fill_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") 
+}
+
+## manufacturer en x
+p_colbar_2 <- function(data, mapping, ...) {
+
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]]))
+
+  d |> ggplot(aes(x = .data[[x_name]], fill = .data[[y_name]])) +
+    geom_bar(position = "fill", colour = "white", linewidth = 0.2) +
+    geom_text(stat = "count", position = position_fill(vjust = 0.5), 
+              aes(label = ifelse(after_stat(count / ave(count, x, FUN = sum)) > 0.10, 
+                                 scales::percent(after_stat(count / ave(count, x, FUN = sum)), accuracy = 1),"")),
+              colour = "white",size = 2) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30,hjust = 1), 
+          legend.position = "none",
+          panel.grid = element_blank()) +
+    paletteer::scale_fill_paletteer_d("nbapalettes::sixers_retro")
+}
+
+## sex en x
+p_colbar_3 <- function(data, mapping, ...) {
+
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]]))
+
+  d |> ggplot(aes(x = .data[[x_name]], fill = .data[[y_name]])) +
+    geom_bar(position = "fill", colour = "white", linewidth = 0.2) +
+    geom_text(stat = "count", position = position_fill(vjust = 0.5), 
+              aes(label = ifelse(after_stat(count / ave(count, x, FUN = sum)) > 0.10, 
+                                 scales::percent(after_stat(count / ave(count, x, FUN = sum)), accuracy = 1),"")),
+              colour = "black",size = 2) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30,hjust = 1), 
+          legend.position = "none",
+          panel.grid = element_blank()) +
+    paletteer::scale_fill_paletteer_d("wesanderson::GrandBudapest2")
+}
+
+# -- Scatter plots
+## between metrics
+p_scatter_metric <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+  
+  ggplot(data, mapping) +
+    geom_point(alpha = 0.25, size = 0.7, colour = "grey20") +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 0.7, colour = "#fd6a00") +
+    theme_bw(base_size = 7)
+}
+
+## with age
+p_scatter_age <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+  
+  ggplot(data, mapping) +
+    geom_point(alpha = 0.25, size = 0.7, colour = "grey20") +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 0.7, colour = "#750985") +
+    theme_bw(base_size = 7)
+}
+
+# Format p-values
+format_pval <- function(p) {
+  dplyr::case_when(p < 0.001 ~ "p < 0.001***",
+                   p < 0.01 ~ paste0("p = ", round(p, 3), "**"),
+                   p < 0.05 ~ paste0("p = ", round(p, 3), "*"),
+                   TRUE ~ paste0("p = ", round(p, 3)))
+}
+
+format_pval_star <- function(p) {
+  dplyr::case_when(p < 0.001 ~ "***",
+                   p < 0.01 ~ "**",
+                   p < 0.05 ~ "*",
+                   TRUE ~ "")
+}
+
+# -- Correlation coef
+p_cor_text <- function(data, mapping, method = c("pearson", "kendall", "spearman"), ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  corr <- cor.test(data[[x_name]], data[[y_name]], use = "complete.obs", method = method)
+  r <- round(corr$estimate, 2)
+  sym <- if (method == "kendall") "τ" else "r"
+
+  p_lab <- format_pval(corr$p.value)
+  method_lab <- case_when(method=="pearson" ~ "Pearson",
+                          method=="kendall" ~ "Kendall",
+                          method=="spearman" ~ "Spearman")
+
+  ggplot(data, mapping) +
+    geom_blank() +
+    annotate("text",x= mean(range(data[[x_name]], na.rm = TRUE)),
+             y= mean(range(data[[y_name]], na.rm = TRUE)),
+             label = paste0(method_lab, ":\n",sym, " = ", r, "\n", p_lab),
+             size = 2.5,
+             colour = "#fd6a00") +
+    theme_bw(base_size = 7) +
+    theme(axis.text  = element_blank(),
+          axis.ticks = element_blank(),
+          panel.grid = element_blank())
+}
+
+## pearson or kendall
+p_cor_p <- function(data, mapping, ...) p_cor_text(data, mapping, method = "pearson",  ...)
+p_cor_s <- function(data, mapping, ...) p_cor_text(data, mapping, method = "spearman",  ...)
+p_cor_t <- function(data, mapping, ...) p_cor_text(data, mapping, method = "kendall", ...)
+
+
+# -- Logistic glm (x= metric, y= vr)
+p_logist_text <- function(data, mapping, site_var = NULL, ...) {
+  x_name <- rlang::as_name(mapping$x) 
+  y_name <- rlang::as_name(mapping$y)
+  
+  df <- data |> filter(!is.na(.data[[x_name]]))
+
+  # kendall τ between metric and visual ratings
+  y_num <- as.numeric(df[[x_name]])
+  kt <- cor.test(df[[y_name]], y_num, use = "complete.obs", method = "kendall")
+
+  tau <- round(kt$estimate, 2)
+  tau_p <- format_pval_star(kt$p.value)
+
+  # glm
+  df_glm <- df |>
+    mutate(.fail = case_when(.data[[x_name]] == "Pass" ~ 1L,
+                             .data[[x_name]] %in% c("Flag", "Fail") ~ 0L)) |>
+    filter(!is.na(.fail))
+
+  predictors <- c(y_name, "vis_qc_rater")
+  if (!is.null(site_var)) predictors <- c(predictors, site_var)
+  m_formula <- as.formula(paste(".fail ~", paste(predictors, collapse = " + ")))
+
+  m<- glm(m_formula, family = "binomial", data = df_glm)
+  stat_term <- summary(m)$coefficients[y_name, , drop = FALSE]
+  z_val <- round(stat_term[, "z value"], 2)
+  z_p <- format_pval_star(stat_term[, "Pr(>|z|)"])
+
+  # Prepare text for plot
+  label_txt <- paste0("Kendall:\n τ =", tau, tau_p, "\nGLM:\nZ = ", z_val, z_p)
+
+  data |> 
+    # filter(!is.na(.data[[y_name]])) |> 
+    ggplot(mapping) +
+    geom_blank() +
+    annotate("text", 
+             x= 0.5,
+             y = 0.5,
+             label = label_txt,
+             size = 2.5,
+             colour = "deepskyblue4") +
+    theme_bw(base_size = 7) +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(), panel.grid = element_blank()) +
+    coord_cartesian(xlim = c(0,1), ylim = c(0,1))
+}
+
+# Regression age
+p_lmer_num_text <- function(data, mapping, site_var = NULL, ...) {
+  x_name <- rlang::as_name(mapping$x) 
+  y_name <- rlang::as_name(mapping$y)
+
+  predictors <- c(x_name, "sex")
+  if (!is.null(site_var)) predictors <- c(predictors, site_var)
+  m_formula <- as.formula(paste(y_name,"~", paste(predictors, collapse = " + "), "+ (1|subject)"))
+
+  m<- lmerTest::lmer(m_formula, data = data)
+  stat_term <- summary(m)$coefficients[x_name, , drop = FALSE]
+  t_val <- round(stat_term[, "t value"], 2)
+  t_p <- format_pval(stat_term[, "Pr(>|t|)"])
+
+  # Prepare text for plot
+  label_txt <- paste0("LMM:\nt = ", t_val, "\n", t_p)
+
+  ggplot(data, mapping) +
+    geom_blank() +
+    annotate("text", 
+             x= mean(range(data[[x_name]], na.rm = TRUE)),
+             y = mean(range(data[[y_name]], na.rm = TRUE)),
+             label = label_txt,
+             size = 2.5,
+             colour = "#750985") +
+    theme_bw(base_size = 7) +
+    theme(axis.text  = element_blank(), axis.ticks = element_blank(), panel.grid = element_blank())
+}
+
+# no site
+p_logist_text_nosite <- function(data, mapping, ...) {
+  p_logist_text(data, mapping, site_var = NULL, ...)
+}
+### replace site variable here !!!
+p_logist_text_site <- function(data, mapping, ...) {
+  p_logist_text(data, mapping, site_var = "site", ...)
+}
+
+
+# -- Make router
+metric_vars <- c("fd", "dice_coreg", "nmi_coreg", "dropout_score", "nmi_norm")
+num_vars <- c("age")
+sex <- "sex"
+site <- "site"
+vr_vars  <- c("vr_coreg", "vr_dropout")
+
+
+make_router_lower <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  x_metric <- x_name %in% metric_vars
+  x_num <- x_name %in% num_vars
+  x_sex <- x_name == sex
+  x_site <- x_name == site
+  x_vr <- x_name %in% vr_vars
+  y_metric <- y_name %in% metric_vars
+  y_num <- y_name %in% num_vars
+  y_sex <- y_name == sex
+  y_site <- y_name == site
+  y_vr <- y_name %in% vr_vars
+
+  if (x_metric && y_metric) p_scatter_metric(data, mapping, ...)
+  else if (x_metric && y_num) p_scatter_age(data, mapping, ...)
+  else if (x_metric && y_sex) p_hist_num_2(data, mapping, ...)
+  else if (x_num && y_sex) p_hist_num_2(data, mapping, ...)
+  else if (x_num && y_site) p_hist_num_3(data, mapping, ...)
+  else if (x_metric && y_site) p_hist_num_3(data, mapping, ...)
+  else if (x_metric && y_vr) p_boxplot_vr(data, mapping, ...)
+  else if (x_num && y_vr) p_violin_vr(data, mapping, ...)
+  else if (x_vr && y_vr) p_colbar_vr(data, mapping, ...)
+  else if (y_site && x_sex) p_colbar_3(data, mapping, ...)
+  else if (x_site && y_vr) p_colbar_vr(data, mapping, ...)
+  else if (x_sex && y_vr) p_colbar_vr(data, mapping, ...)
+  else ggally_blank()
+}
+
+make_router_upper <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  x_metric <- x_name %in% metric_vars
+  x_num <- x_name %in% num_vars
+  x_sex <- x_name == sex
+  x_site <- x_name == site
+  x_vr <- x_name %in% vr_vars
+  y_metric <- y_name %in% metric_vars
+  y_num <- y_name %in% num_vars
+  y_sex <- y_name == sex
+  y_site <- y_name == site
+  y_vr <- y_name %in% vr_vars
+
+  if (x_metric && y_metric)  p_cor_p(data, mapping, ...)
+  else if (x_num && y_metric)  p_lmer_num_text(data, mapping, ...)
+  else if (x_sex && y_metric) p_boxplot_2(data, mapping, ...)
+  else if (x_sex && y_num) p_boxplot_2(data, mapping, ...)
+  else if (x_site && y_metric) p_boxplot_3(data, mapping, ...)
+  else if (x_site && y_num) p_boxplot_3(data, mapping, ...)
+  else if (y_metric && x_vr) p_logist_text_site(data, mapping)  
+  else if (y_site && x_vr) p_square_3(data, mapping, ...)
+  else if (y_sex && x_vr) p_square_2(data, mapping, ...)
+  else if (y_vr && x_vr) p_square(data, mapping, ...)
+  else if (x_site && y_sex) p_colbar_2(data, mapping, ...)
+  else if (y_num && x_vr) p_jitter_vr(data, mapping, ...)
+  else ggally_blank()
+}
+
+
+make_diag <- function(data, mapping, ...) {
+  nm <- rlang::as_name(mapping$x)
+  if (nm %in% num_vars) p_hist_num_1(data, mapping, ...)
+  else if (nm %in% metric_vars) p_hist_num_1(data, mapping, ...)
+  else if (nm == sex) p_bar_count_2(data, mapping, ...)
+  else if (nm == site) p_bar_count_3(data, mapping, ...)
+  else if (nm %in% vr_vars) p_bar_count_vr(data, mapping, ...)
+}
+
+# -- Prepare data
+vars_order <- c(metric_vars,num_vars, sex, site, vr_vars)
+
+df.plot <- data_rosmap |>
+  select(all_of(vars_order), vis_qc_rater, subject) |>
+  mutate_if(is.character, as.factor)
+
+# -- Plot
+p <- df.plot |>
+  ggpairs(columns = vars_order,
+    lower = list(continuous = make_router_lower, combo = make_router_lower, discrete = make_router_lower),
+    upper = list(continuous = make_router_upper, combo = make_router_upper, discrete = make_router_upper),
+    diag = list(continuous = make_diag, discrete = make_diag,na = ggally_blank),
+    progress = FALSE) +
+  theme_bw(base_size = 8) +
+  theme(strip.text = element_text(size = 6,colour="black"), strip.background =element_rect(fill="grey80"),
+        # axis.text.x = element_text(angle = 45, hjust = 1), axis.text.y = element_text(angle = 45, hjust = 1),
+        panel.spacing = unit(0.5, "lines"))
+
+print(p)
+
+ggsave(filename = "pairplot_rosmap.svg", plot = p, device = svg(), path = "plots/", height = 9, width = 14)
+dev.off()
+
+```
+
+## Vallecas
+```{r}
+
+library(GGally)
+
+# -- Config some settings for later use
+vr_levels  <- c("Fail", "Flag", "Pass", NA) 
+viridis_opts <- list(discrete = TRUE, option = "D", end = 0.8, begin = 0.2)
+alpha_na <- function(levels, base = 1, na_alpha = 0.25) {
+  ifelse(is.na(levels) | levels == "NA", na_alpha, base)
+}
+
+# -- Whole sample histogram for numerical variables
+p_hist_num_1 <- function(data, mapping, ...) {
+  ggplot(data, mapping) +
+    geom_histogram(aes(y = after_stat(density)),
+                   bins = 30, fill = "grey20", colour = "grey80") +
+    geom_density(colour = "deepskyblue4", linewidth = 0.5) +
+    theme_bw(base_size = 7)
+}
+
+# -- Histogram for numerical variables divided per categories 
+## 2 categories
+p_hist_num_2 <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x) 
+  y_name <- rlang::as_name(mapping$y) 
+
+  data |> 
+    filter(!is.na(.data[[y_name]])) |> 
+    ggplot(aes(x = .data[[x_name]], fill = .data[[y_name]])) +
+    geom_histogram(bins = 25, colour = "white", position = "identity", alpha= 0.7) +
+    paletteer::scale_fill_paletteer_d("nbapalettes::sixers_retro") +
+    theme_bw(base_size = 7)
+}
+
+
+
+# -- Jitter age visual ratings
+p_jitter_vr <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |> 
+    filter(!is.na(.data[[x_name]]))
+  
+  d |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], fill = .data[[x_name]], color = .data[[x_name]])) +
+    scale_colour_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    scale_fill_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    geom_jitter(alpha= 0.8, width=0.1) +
+    stat_summary(fun = mean, geom = "label",
+                 aes(label = round(after_stat(y), 1)),
+                 fill = "#750985", color = "white", size = 2,label.size = 0) +
+    theme_bw(base_size = 7) 
+}
+
+
+# -- Violin visual ratings
+p_violin_vr <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |> 
+    filter(!is.na(.data[[y_name]]))
+  
+  d |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], fill = .data[[y_name]])) +
+    scale_colour_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    scale_fill_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    geom_violin(alpha= 0.8, colour="white") +
+    geom_boxplot(width=0.1, colour="white") +
+    theme_bw(base_size = 7) 
+}
+
+# -- Boxplot visual ratings
+p_boxplot_vr <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |> 
+    filter(!is.na(.data[[y_name]]))
+  
+  d |> ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], colour = .data[[y_name]])) +
+    scale_colour_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") +
+    geom_violin(colour = "white", fill = "white") +
+    geom_boxplot(outlier.colour = NA) +
+    geom_jitter(alpha = 0.15) +
+    theme_bw(base_size = 7) 
+}
+
+# -- Bar plot with N 
+# 2 categories 
+p_bar_count_2 <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+
+  data |> 
+    filter(!is.na(.data[[x_name]])) |> 
+    ggplot(aes(x = .data[[x_name]], fill = .data[[x_name]])) +
+    geom_bar() +
+    geom_text(stat = "count",
+              aes(label = paste0("n = ", after_stat(count))),
+              vjust = -0.3, size = 2) +
+    scale_fill_viridis(discrete = TRUE, option = "D", end = 0.8, begin = 0.2,
+                       guide = "none") +
+    paletteer::scale_fill_paletteer_d("nbapalettes::sixers_retro") +
+    theme_bw(base_size = 7) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          axis.title  = element_blank()) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20)))
+}
+
+# vr 
+p_bar_count_vr <- function(data, mapping, ...) {
+  x_name  <- rlang::as_name(mapping$x)
+  data |> filter(!is.na(.data[[x_name]])) |> 
+    ggplot(aes(x = .data[[x_name]], fill = .data[[x_name]])) +
+    geom_bar() +
+    geom_text(stat = "count",
+              aes(label = paste0("n = ", after_stat(count))),
+              vjust = -0.3, size = 2) +
+    scale_fill_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2) +
+    theme_bw(base_size = 7) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          axis.title  = element_blank()) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20)))
+}
+
+# -- Boxplot with par category 
+# 2 categories 
+p_boxplot_2 <- function(data, mapping, ...) {
+  
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |> 
+    filter(!is.na(.data[[x_name]]))
+  
+  # add stats
+  predictors <- c(x_name, "age")
+  m_formula <- as.formula(paste(y_name,"~", paste(predictors, collapse = " + "), "+ (1|subject)"))
+
+  m<- lmerTest::lmer(m_formula, data = d)
+  emm_formula <- as.formula(paste("pairwise ~", x_name))
+  temp <- emmeans::emmeans(m, emm_formula)$contrast |> as.data.frame()
+  t_val <- round(temp[, "t.ratio"], 2)
+  t_p <- format_pval_star(temp[, "p.value"])
+
+  label_txt <- paste0("t = ", t_val, t_p)
+  
+  y_max <- max(d[[y_name]], na.rm = TRUE)
+  y_min <- min(d[[y_name]], na.rm = TRUE)
+  y_range <- y_max - y_min
+  seg_y  <- y_max + 0.08 * y_range
+  text_y <- y_max + 0.14 * y_range
+  
+  d |>
+    filter(!is.na(.data[[x_name]]),!is.na(.data[[y_name]])) |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], color = .data[[x_name]])) +
+    geom_boxplot(outlier.size = 0.4, outlier.alpha = 0.5) +
+    paletteer::scale_color_paletteer_d("nbapalettes::sixers_retro") +
+    theme_bw(base_size = 7) +
+    theme(axis.title.x = element_blank(),
+          axis.text.x  = element_text(angle = 30, hjust = 1)) +
+    annotate("segment", x=1, xend=2, y=seg_y, yend=seg_y, linewidth=0.3) +
+    annotate("text", x=1.5, y=text_y, label = label_txt, size=2, vjust= 0) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.20)))
+}
+
+
+# -- Square plot with N 
+p_square <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]])) |> 
+    count(.data[[x_name]], .data[[y_name]]) |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]])) +
+    geom_point(aes(size = n), shape = 15, show.legend = FALSE, color="grey20") +
+    geom_label(aes(label = paste0("n = ",n)), fill="grey20", size=2, label.size=0, color="white") +
+    scale_size_area(max_size = 7) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30, hjust = 1))
+}
+
+p_square_2 <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]])) |> 
+    count(.data[[x_name]], .data[[y_name]]) |> 
+    ggplot(aes(x = .data[[x_name]], y = .data[[y_name]], color = .data[[x_name]])) +
+    geom_point(aes(size = n), shape = 15, show.legend = FALSE) +
+    scale_color_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2) +
+    # new_scale_color() +
+    # geom_text(aes(label = n, color = .data[[y_name]])) +
+    geom_label(aes(label = paste0("n = ",n), fill= .data[[y_name]]), size=2, label.size=0, color="white") +
+    paletteer::scale_fill_paletteer_d("nbapalettes::sixers_retro") +
+    scale_size_area(max_size = 10) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30, hjust = 1))
+}
+
+
+# -- Bar plot percentage
+p_colbar_vr <- function(data, mapping, ...) {
+
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+  
+  x_levels <- levels(factor(data[[x_name]]))
+  d <- data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]])) |> 
+    mutate(!!x_name := factor(.data[[x_name]], levels = x_levels))
+
+  d |> ggplot(aes(x = .data[[x_name]], fill = .data[[y_name]])) +
+    geom_bar(position = "fill", colour = "white", linewidth = 0.2) +
+    geom_text(stat = "count", position = position_fill(vjust = 0.5), 
+              aes(label = ifelse(after_stat(count / ave(count, x, FUN = sum)) > 0.10, 
+                                 scales::percent(after_stat(count / ave(count, x, FUN = sum)), accuracy = 1),"")),
+              colour = "white",size = 2) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30,hjust = 1), 
+          legend.position = "none",
+          panel.grid = element_blank()) +
+    scale_x_discrete(drop = FALSE) +
+    scale_fill_viridis(discrete = TRUE, option = "D",
+                         end = 0.8, begin = 0.2, guide = "none") 
+}
+
+## manufacturer en x
+p_colbar_2 <- function(data, mapping, ...) {
+
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  d <- data |>
+    filter(!is.na(.data[[x_name]]), !is.na(.data[[y_name]]))
+
+  d |> ggplot(aes(x = .data[[x_name]], fill = .data[[y_name]])) +
+    geom_bar(position = "fill", colour = "white", linewidth = 0.2) +
+    geom_text(stat = "count", position = position_fill(vjust = 0.5), 
+              aes(label = ifelse(after_stat(count / ave(count, x, FUN = sum)) > 0.10, 
+                                 scales::percent(after_stat(count / ave(count, x, FUN = sum)), accuracy = 1),"")),
+              colour = "white",size = 2) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    theme_bw(base_size = 7) +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 30,hjust = 1), 
+          legend.position = "none",
+          panel.grid = element_blank()) +
+    paletteer::scale_fill_paletteer_d("nbapalettes::sixers_retro")
+}
+
+
+
+# -- Scatter plots
+## between metrics
+p_scatter_metric <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+  
+  ggplot(data, mapping) +
+    geom_point(alpha = 0.25, size = 0.7, colour = "grey20") +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 0.7, colour = "#fd6a00") +
+    theme_bw(base_size = 7)
+}
+
+## with age
+p_scatter_age <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+  
+  ggplot(data, mapping) +
+    geom_point(alpha = 0.25, size = 0.7, colour = "grey20") +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 0.7, colour = "#750985") +
+    theme_bw(base_size = 7)
+}
+
+# Format p-values
+format_pval <- function(p) {
+  dplyr::case_when(p < 0.001 ~ "p < 0.001***",
+                   p < 0.01 ~ paste0("p = ", round(p, 3), "**"),
+                   p < 0.05 ~ paste0("p = ", round(p, 3), "*"),
+                   TRUE ~ paste0("p = ", round(p, 3)))
+}
+
+format_pval_star <- function(p) {
+  dplyr::case_when(p < 0.001 ~ "***",
+                   p < 0.01 ~ "**",
+                   p < 0.05 ~ "*",
+                   TRUE ~ "")
+}
+
+# -- Correlation coef
+p_cor_text <- function(data, mapping, method = c("pearson", "kendall", "spearman"), ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  corr <- cor.test(data[[x_name]], data[[y_name]], use = "complete.obs", method = method)
+  r <- round(corr$estimate, 2)
+  sym <- if (method == "kendall") "τ" else "r"
+
+  p_lab <- format_pval(corr$p.value)
+  method_lab <- case_when(method=="pearson" ~ "Pearson",
+                          method=="kendall" ~ "Kendall",
+                          method=="spearman" ~ "Spearman")
+
+  ggplot(data, mapping) +
+    geom_blank() +
+    annotate("text",x= mean(range(data[[x_name]], na.rm = TRUE)),
+             y= mean(range(data[[y_name]], na.rm = TRUE)),
+             label = paste0(method_lab, ":\n",sym, " = ", r, "\n", p_lab),
+             size = 2.5,
+             colour = "#fd6a00") +
+    theme_bw(base_size = 7) +
+    theme(axis.text  = element_blank(),
+          axis.ticks = element_blank(),
+          panel.grid = element_blank())
+}
+
+## pearson or kendall
+p_cor_p <- function(data, mapping, ...) p_cor_text(data, mapping, method = "pearson",  ...)
+p_cor_s <- function(data, mapping, ...) p_cor_text(data, mapping, method = "spearman",  ...)
+p_cor_t <- function(data, mapping, ...) p_cor_text(data, mapping, method = "kendall", ...)
+
+
+# -- Logistic glm (x= metric, y= vr)
+p_logist_text <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x) 
+  y_name <- rlang::as_name(mapping$y)
+  
+  df <- data |> filter(!is.na(.data[[x_name]]))
+
+  # kendall τ between metric and visual ratings
+  y_num <- as.numeric(df[[x_name]])
+  kt <- cor.test(df[[y_name]], y_num, use = "complete.obs", method = "kendall")
+
+  tau <- round(kt$estimate, 2)
+  tau_p <- format_pval_star(kt$p.value)
+
+  # glm
+  df_glm <- df |>
+    mutate(.fail = case_when(.data[[x_name]] == "Pass" ~ 1L,
+                             .data[[x_name]] %in% c("Flag", "Fail") ~ 0L)) |>
+    filter(!is.na(.fail))
+
+  predictors <- c(y_name, "vis_qc_rater")
+  m_formula <- as.formula(paste(".fail ~", paste(predictors, collapse = " + ")))
+
+  m<- glm(m_formula, family = "binomial", data = df_glm)
+  stat_term <- summary(m)$coefficients[y_name, , drop = FALSE]
+  z_val <- round(stat_term[, "z value"], 2)
+  z_p <- format_pval_star(stat_term[, "Pr(>|z|)"])
+
+  # Prepare text for plot
+  label_txt <- paste0("Kendall:\n τ =", tau, tau_p, "\nGLM:\nZ = ", z_val, z_p)
+
+  data |> 
+    # filter(!is.na(.data[[y_name]])) |> 
+    ggplot(mapping) +
+    geom_blank() +
+    annotate("text", 
+             x= 0.5,
+             y = 0.5,
+             label = label_txt,
+             size = 2.5,
+             colour = "deepskyblue4") +
+    theme_bw(base_size = 7) +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(), panel.grid = element_blank()) +
+    coord_cartesian(xlim = c(0,1), ylim = c(0,1))
+}
+
+# Regression age
+p_lmer_num_text <- function(data, mapping,...) {
+  x_name <- rlang::as_name(mapping$x) 
+  y_name <- rlang::as_name(mapping$y)
+
+  predictors <- c(x_name, "sex")
+  m_formula <- as.formula(paste(y_name,"~", paste(predictors, collapse = " + "), "+ (1|subject)"))
+
+  m<- lmerTest::lmer(m_formula, data = data)
+  stat_term <- summary(m)$coefficients[x_name, , drop = FALSE]
+  t_val <- round(stat_term[, "t value"], 2)
+  t_p <- format_pval(stat_term[, "Pr(>|t|)"])
+
+  # Prepare text for plot
+  label_txt <- paste0("LMM:\nt = ", t_val, "\n", t_p)
+
+  ggplot(data, aes(x = .data[[x_name]], y = .data[[y_name]])) +
+    geom_blank() +
+    annotate("text", 
+             x= mean(range(data[[x_name]], na.rm = TRUE)),
+             y = mean(range(data[[y_name]], na.rm = TRUE)),
+             label = label_txt,
+             size = 2.5,
+             colour = "#750985") +
+    theme_bw(base_size = 7) +
+    theme(axis.text  = element_blank(), axis.ticks = element_blank(), panel.grid = element_blank())
+}
+
+# no site
+p_logist_text_nosite <- function(data, mapping, ...) {
+  p_logist_text(data, mapping,...)
+}
+
+
+# -- Make router
+metric_vars <- c("fd", "dice_coreg", "nmi_coreg", "dropout_score", "nmi_norm")
+num_vars <- c("age")
+sex <- "sex"
+vr_vars  <- c("vr_coreg", "vr_dropout", "vr_distor")
+
+
+make_router_lower <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  x_metric <- x_name %in% metric_vars
+  x_num <- x_name %in% num_vars
+  x_sex <- x_name == sex
+  x_vr <- x_name %in% vr_vars
+  y_metric <- y_name %in% metric_vars
+  y_num <- y_name %in% num_vars
+  y_sex <- y_name == sex
+  y_vr <- y_name %in% vr_vars
+
+  if (x_metric && y_metric) p_scatter_metric(data, mapping, ...)
+  else if (x_metric && y_num) p_scatter_age(data, mapping, ...)
+  else if (x_metric && y_sex) p_hist_num_2(data, mapping, ...)
+  else if (x_num && y_sex) p_hist_num_2(data, mapping, ...)
+  else if (x_metric && y_vr) p_boxplot_vr(data, mapping, ...)
+  else if (x_num && y_vr) p_violin_vr(data, mapping, ...)
+  else if (x_vr && y_vr) p_colbar_vr(data, mapping, ...)
+  else if (x_sex && y_vr) p_colbar_vr(data, mapping, ...)
+  else ggally_blank()
+}
+
+make_router_upper <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+
+  x_metric <- x_name %in% metric_vars
+  x_num <- x_name %in% num_vars
+  x_sex <- x_name == sex
+  x_vr <- x_name %in% vr_vars
+  y_metric <- y_name %in% metric_vars
+  y_num <- y_name %in% num_vars
+  y_sex <- y_name == sex
+  y_vr <- y_name %in% vr_vars
+
+  if (x_metric && y_metric)  p_cor_p(data, mapping, ...)
+  else if (x_num && y_metric)  p_lmer_num_text(data, mapping, ...)
+  else if (x_sex && y_metric) p_boxplot_2(data, mapping, ...)
+  else if (x_sex && y_num) p_boxplot_2(data, mapping, ...)
+  else if (y_metric && x_vr) p_logist_text_nosite(data, mapping)  
+  else if (y_sex && x_vr) p_square_2(data, mapping, ...)
+  else if (y_vr && x_vr) p_square(data, mapping, ...)
+  else if (y_num && x_vr) p_jitter_vr(data, mapping, ...)
+  else ggally_blank()
+}
+
+
+make_diag <- function(data, mapping, ...) {
+  nm <- rlang::as_name(mapping$x)
+  if (nm %in% num_vars) p_hist_num_1(data, mapping, ...)
+  else if (nm %in% metric_vars) p_hist_num_1(data, mapping, ...)
+  else if (nm == sex) p_bar_count_2(data, mapping, ...)
+  else if (nm %in% vr_vars) p_bar_count_vr(data, mapping, ...)
+}
+
+make_router_upper_debug <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+  tryCatch(
+    make_router_upper(data, mapping, ...),
+    error = function(e) {
+      message("ERROR in upper — x=", x_name, " y=", y_name, " : ", e$message)
+      ggally_blank()
+    }
+  )
+}
+
+make_router_lower_debug <- function(data, mapping, ...) {
+  x_name <- rlang::as_name(mapping$x)
+  y_name <- rlang::as_name(mapping$y)
+  tryCatch(
+    make_router_lower(data, mapping, ...),
+    error = function(e) {
+      message("ERROR in lower — x=", x_name, " y=", y_name, " : ", e$message)
+      ggally_blank()
+    }
+  )
+}
+
+# -- Prepare data
+vars_order <- c(metric_vars,num_vars, sex, vr_vars)
+
+df.plot <- data_vallecas |>
+  select(all_of(vars_order), vis_qc_rater, subject) |>
+  mutate_if(is.character, as.factor)
+
+# -- Plot
+p <- df.plot |>
+  ggpairs(columns = vars_order,
+    lower = list(continuous = make_router_lower_debug, combo = make_router_lower_debug, discrete = make_router_lower_debug),
+    upper = list(continuous = make_router_upper_debug, combo = make_router_upper_debug, discrete = make_router_upper_debug),
+    diag = list(continuous = make_diag, discrete = make_diag,na = ggally_blank),
+    progress = FALSE) +
+  theme_bw(base_size = 8) +
+  theme(strip.text = element_text(size = 6,colour="black"), strip.background =element_rect(fill="grey80"),
+        # axis.text.x = element_text(angle = 45, hjust = 1), axis.text.y = element_text(angle = 45, hjust = 1),
+        panel.spacing = unit(0.5, "lines"))
+
+print(p)
+
+ggsave(filename = "pairplot_vallecas.svg", plot = p, device = svg(), path = "plots/", height = 9, width = 14)
+dev.off()
+
+```
+
+
+# VR plot
+```{r}
+
+library(ggh4x) 
+
+metric_vars <- c("dice_coreg", "nmi_coreg", "dropout_score", "nmi_norm")
+vr_vars  <- c("vr_coreg", "vr_dropout")
+cohort_labels <- c(A4LEARN="A4-LEARN (n=478)", ROSMAP="ROSMAP (n=449)", Vallecas="Vallecas (n=1309)")
+metric3_labels <- c(dice_coreg="Dice t1w-bold", nmi_coreg="NMI t1w-bold", dropout_score="Dropout score")
+metric4_labels <- c(dice_coreg="Dice t1w-bold", nmi_coreg="NMI t1w-bold", dropout_score="Dropout score", nmi_norm="NMI t1w-mni")
+nmi_norm_labels <- c(nmi_norm="NMI t1w-mni")
+
+df_a4 <- data_a4 |> select(dataset, code, all_of(metric_vars), all_of(vr_vars), vis_qc_rater)
+df_rosmap <- data_rosmap |> select(dataset, code, all_of(metric_vars), all_of(vr_vars), vis_qc_rater, vr_norm)
+df_vallecas <- data_vallecas |> select(dataset, code, all_of(metric_vars), all_of(vr_vars), vis_qc_rater)
+
+df <- bind_rows(df_a4, df_rosmap, df_vallecas)
+
+cohort_colors <- c("#0E7175FF", "#FD7901FF", "#C35BCAFF")
+
+g1 <- df |> 
+  filter(!is.na(vis_qc_rater)) |> 
+  pivot_longer(cols = metric_vars, names_to = "metric", values_to = "metric_value") |> 
+  mutate(vr= case_when(metric == "dropout_score" ~ vr_dropout, 
+                       metric %in% c("dice_coreg", "nmi_coreg") ~ vr_coreg,
+                       metric == "nmi_norm" ~ vr_norm),
+         metric = factor(metric, levels = metric_vars)) |> 
+  filter(!is.na(vr)) |> 
+  ggplot(aes(x=metric_value, y= vr, colour=vr)) +
+  geom_violin(aes(fill=vr), alpha=0.3, color=NA) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(alpha = 0.15, size=0.5) +
+  theme_light()  +
+  paletteer::scale_colour_paletteer_d("unikn::pal_signal") +
+  paletteer::scale_fill_paletteer_d("unikn::pal_signal") +
+  facet_grid2(metric ~ dataset, scales = "free_x", independent = "x",
+              strip=strip_themed(background_x = elem_list_rect(fill = cohort_colors, color=cohort_colors),
+                                 text_x = elem_list_text(colour = "white"),
+                                 background_y = elem_list_rect(fill = "grey30", color="grey30"),
+                                 text_y = elem_list_text(colour = "white")),
+              labeller = labeller(dataset = cohort_labels, metric = metric4_labels),
+              switch="y") +
+  labs(x="", y="Visual QC rating") +
+  theme(legend.position = "none", axis.text.y = element_text(angle = 30)) +
+  scale_y_discrete(position = "right")
+g1
+
+
+
+
+g2 <- df |> 
+  filter(!is.na(vis_qc_rater)) |> 
+  pivot_longer(cols = metric_vars, names_to = "metric", values_to = "metric_value") |> 
+  mutate(vr= case_when(metric == "dropout_score" ~ vr_dropout, 
+                       metric %in% c("dice_coreg", "nmi_coreg") ~ vr_coreg,
+                       metric == "nmi_norm" ~ vr_norm),
+         metric = factor(metric, levels = metric_vars)) |> 
+  filter(!is.na(vr), metric %in% c("dice_coreg", "nmi_coreg", "dropout_score")) |> 
+  ggplot(aes(x=metric_value, y= vr, colour=vr)) +
+  geom_violin(aes(fill=vr), alpha=0.3, color=NA) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(alpha = 0.15, size=0.5) +
+  theme_light()  +
+  paletteer::scale_colour_paletteer_d("unikn::pal_signal") +
+  paletteer::scale_fill_paletteer_d("unikn::pal_signal") +
+  facet_grid2(metric ~ dataset, scales = "free_x", independent = "x",
+              strip=strip_themed(background_x = elem_list_rect(fill = "white", color=NULL),
+                                 text_x = elem_list_text(colour = cohort_colors),
+                                 background_y = elem_list_rect(fill = "white"),
+                                 text_y = elem_list_text(colour = "black")),
+              labeller = labeller(dataset = cohort_labels, metric = metric4_labels),
+              switch="y") +
+  labs(x="", y="Visual QC rating") +
+  theme(legend.position = "none", axis.text.y = element_text(angle = 30), panel.border = element_rect(colour = "grey70")) +
+  scale_y_discrete(position = "right")
+g2
+
+ggsave(filename = "vr_metric3_n.svg", plot = g2, device = svg(), path = "poster_plots", height = 4, width = 6.5)
+dev.off()
+
+g3 <- df |> 
+  filter(!is.na(vis_qc_rater)) |> 
+  pivot_longer(cols = metric_vars, names_to = "metric", values_to = "metric_value") |> 
+  mutate(vr= case_when(metric == "dropout_score" ~ vr_dropout, 
+                       metric %in% c("dice_coreg", "nmi_coreg") ~ vr_coreg,
+                       metric == "nmi_norm" ~ vr_norm),
+         metric = factor(metric, levels = metric_vars)) |> 
+  filter(!is.na(vr), metric %in% c("nmi_norm")) |> 
+  ggplot(aes(x=metric_value, y= vr, colour=vr)) +
+  geom_violin(aes(fill=vr), alpha=0.3, color=NA) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(alpha = 0.15) +
+  theme_light()  +
+  paletteer::scale_colour_paletteer_d("unikn::pal_signal") +
+  paletteer::scale_fill_paletteer_d("unikn::pal_signal") +
+  facet_grid2(metric ~ dataset, scales = "free_x", independent = "x",
+              strip=strip_themed(background_x = elem_list_rect(fill = "white", color=NULL),
+                                 text_x = elem_list_text(colour = "#FD7901FF"),
+                                 background_y = elem_list_rect(fill = "white"),
+                                 text_y = elem_list_text(colour = "black")),
+              labeller = labeller(dataset = cohort_labels, metric = metric4_labels),
+              switch="y") +
+  labs(x="", y="Visual QC rating") +
+  theme(legend.position = "none", axis.text.y = element_text(angle = 30), axis.title.y = element_blank(), panel.border = element_rect(colour = "grey70")) +
+  scale_y_discrete(position = "right")
+g3
+
+ggsave(filename = "vr_metric1_n.svg", plot = g3, device = svg(), path = "poster_plots", height = 1.65, width = 2.55)
+dev.off()
+
+
+```
+
+
+# Threshold screen
+```{r}
+
+thr_dice <- compute_thresholds_low_bad(data_rosmap$dice_coreg, percentiles = c(0.10, 0.05), sd_multiplier = c(2, 3), evt_alpha = c(0.01, 0.02))
+
+thr_dice_labeled <- thr_dice |>
+  filter(!grepl("percentile", method)) |>
+  mutate(pct_flagged = sapply(threshold, function(thr) {
+    round(100 * mean(data_rosmap$dice_coreg < thr, na.rm = TRUE), 1)
+    }), method_label = paste0(method, " (", pct_flagged, "% flag)"))
+
+g <- data_rosmap |>
+  ggplot(aes(x = dice_coreg)) +
+  geom_histogram(color = "white", bins = 80, fill = "grey35", linewidth = 0.1) +
+  geom_rug(alpha = 0.8, color = "deepskyblue4") +
+  geom_vline(data = thr_dice_labeled,
+             aes(xintercept = threshold, color = method_label),
+             linetype = 1, linewidth = 0.5) +
+  paletteer::scale_color_paletteer_d("Polychrome::light") +
+  theme_light() +
+  labs(color = NULL, x="Dice t1w-bold", y="Scan count") +
+  theme(axis.title = element_text(size=15), axis.text = element_text(size=12))
+
+g
+ggsave(filename = "dice_all-thrs.svg", plot = g, device = svg(), path = "poster_plots", height = 3, width = 6)
+dev.off()
+
+g <- data_rosmap |>
+  ggplot(aes(x = dice_coreg)) +
+  geom_histogram(color = "white", bins = 80, fill = "grey35", linewidth = 0.1) +
+  geom_rug(alpha = 0.8, color = "deepskyblue4") +
+  geom_vline(data = thr_dice_labeled,
+             aes(xintercept = threshold, color = method_label),
+             linetype = 1, linewidth = 0.5) +
+  paletteer::scale_color_paletteer_d("Polychrome::light") +
+  theme_light() +
+  labs(color = NULL, x="Dice t1w-bold", y="Scan count") +
+  theme(legend.position = "none")
+g
+ggsave(filename = "dice_all-thrs_no-legend.svg", plot = g, device = svg(), path = "poster_plots", height = 2, width = 2)
+dev.off()
+
+avg_thres_rosmap <- read_csv("inputs/quality_metrics/avg_thres_rosmap.csv") 
+
+g <- data_rosmap |>
+  ggplot(aes(x = dice_coreg)) +
+  geom_histogram(color = "white", bins = 80, fill = "grey35", linewidth = 0.1) +
+  geom_rug(alpha = 0.8, color = "deepskyblue4") +
+  geom_vline(data = avg_thres_rosmap |> filter(metric== "dice_coreg"), aes(xintercept = avg_thresh), linetype=1, linewidth=0.5, color="red2") +
+  geom_label(data = avg_thres_rosmap |> filter(metric == "dice_coreg"), 
+             mapping = aes(x = avg_thresh, label = round(avg_thresh, 3), color = "red2"), 
+             y = Inf, vjust = 2, hjust = 1.1, size = 3.5, show.legend = FALSE, label.size = NA, 
+             fill = scales::alpha("white", 0.6)) +
+  theme_light() +
+  theme(strip.background = element_rect(fill = "grey30"), strip.text= element_text(colour = "white")) +
+  labs(x="Dice t1w-bold", y="Scan count")
+ g
+ 
+ggsave(filename = "dice_avg-thrs.svg", plot = g, device = svg(), path = "poster_plots", height = 2, width = 2)
+dev.off()
+
+```
+
+# Example case
+## Rosmap BNK
+```{r}
+
+avg_thres_rosmap <- read_csv("inputs/quality_metrics/avg_thres_rosmap.csv") 
+
+bnk_dice <- read.csv("rosmap/onlybnk_dice_2605.csv") |> 
+  rename(code=sub_ses, new_dice=dice) |> 
+  left_join(data_rosmap |> select(code, dice_coreg) |> rename(old_dice=dice_coreg), by="code") |> 
+  pivot_longer(cols = c(new_dice, old_dice), names_to= "dice") |> 
+  mutate(thres_status = if_else(value > avg_thres_rosmap |> filter(metric=="dice_coreg") |> pull(avg_thresh), "Ok", "Flag")) |> 
+  mutate(dice= factor(dice, levels = c("old_dice", "new_dice"), labels = c("BBR", "FLIRT")),
+         thres_status= factor(thres_status, levels = c("Ok", "Flag")),
+         panel="Dice t1w-bold")
+
+dataDensity <- bnk_dice |>
+  group_by(dice) |>
+  do(data.frame(loc = density(.$value)$x,
+                dens = density(.$value)$y)) |>
+  ungroup() |>
+  mutate(dens = dens / max(dens) * 0.35) |>
+  mutate(dens = if_else(dice == "BBR",.9+(dens * -1), 2.1+(dens)))
+
+g <- bnk_dice |>
+  ggplot(aes(x = dice, y = value)) +
+  geom_point(aes(color = thres_status), alpha = 0.8) +
+  geom_line(aes(group = code), color = "grey80", alpha = 0.3, linewidth = 0.2) +
+  geom_polygon(data = dataDensity, aes(x = dens, y = loc, fill = dice), alpha = 0.5, show.legend = FALSE) +
+  theme_bw() +
+  labs(y = "Dice t1w-bold", color = "Metric-based QC",
+       # title = expression(underline("Example case:") ~ "1.5T BNK scans (ROSMAP)"), 
+       fill="") +
+  scale_y_continuous(sec.axis = dup_axis(labels = NULL)) +
+  theme(axis.title.x = element_blank(), 
+        axis.title.y.left = element_blank(), axis.ticks.y = element_blank(),
+        legend.title = element_text(size=9), legend.text = element_text(size=9),
+        # title = element_text(size=9),
+        # legend.margin = margin(0, 0, 0, 0),
+        # legend.position = c(0.8, 0.2), 
+        legend.background = element_rect(colour = "grey20", linewidth = 0.2)) +
+  scale_color_manual(values = c("#7CCA89FF", "#D01556FF"))+
+  scale_fill_manual(values = c("grey20", "grey20"))
+g
+
+g <- bnk_dice |>
+  ggplot(aes(x = dice, y = value)) +
+  geom_point(aes(color = thres_status), alpha = 0.8) +
+  geom_line(aes(group = code), color = "grey80", alpha = 0.3, linewidth = 0.2) +
+  geom_polygon(data = dataDensity, aes(x = dens, y = loc, fill = dice), alpha = 0.5, show.legend = FALSE) +
+  theme_bw() +
+  labs(y = "Dice t1w-bold", color = "Metric-based QC",
+       # title = expression(underline("Example case:") ~ "1.5T BNK scans (ROSMAP)"), 
+       fill="") +
+  scale_y_continuous(sec.axis = dup_axis(labels = NULL)) +
+  theme(axis.title.x = element_blank(), 
+        axis.title.y.left = element_blank(), axis.ticks.y = element_blank(),
+        legend.title = element_text(size=9), legend.text = element_text(size=9),
+        # title = element_text(size=9),
+        # legend.margin = margin(0, 0, 0, 0),
+        legend.position = "none") +
+  scale_color_manual(values = c("#7CCA89FF", "#D01556FF"))+
+  scale_fill_manual(values = c("grey20", "grey20"))
+g
+ggsave(filename = "dice_bnk.svg", plot = g, device = svg(), path = "poster_plots", height = 2, width = 2)
+dev.off()
+
+```
+
