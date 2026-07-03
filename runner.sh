@@ -5,10 +5,16 @@ set -euo pipefail
 # CONFIGURATION / INPUT SOURCING
 # ============================================================
 
-config_file="${1:-config.yaml}"
+config_file="${1:-}"
+
+if [[ -z "$config_file" ]]; then
+    echo "ERROR: Missing config file." >&2
+    echo "Usage: runner.sh <config.yaml>" >&2
+    exit 1
+fi
 
 if [[ ! -f "$config_file" ]]; then
-    echo "ERROR: Config file not found: $config_file" >&2
+    echo "ERROR: Config file does not exist: $config_file" >&2
     exit 1
 fi
 

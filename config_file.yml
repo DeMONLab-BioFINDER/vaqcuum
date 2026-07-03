@@ -1,3 +1,5 @@
+# user action: Configure the paths and settings for the vaqcuum pipeline
+
 paths:
   tmp_dir: "path/to/tmp_dir"
 
@@ -7,19 +9,24 @@ paths:
   mni_type_res: "MNI152NLin2009cAsym_res-2"
   
 outputs:
+  output_dir: "/path/to/output_dir"
   extracted_metrics_file: "/path/to/extracted_metrics.csv"
 
 inputs:
-  anat_dir: "/path/to/anat_dir"
+  input_dir: "/path/to/input_dir"
 
-  mask_anat: "/path/to/sub-*_ses-*_desc-brain_mask.nii.gz"
-  mask_func: "/path/to/sub-*_ses-*_task-rest_desc-brain_mask.nii.gz"
+  anat_dir: "{input_dir}/anat_dir"
+  func_dir: "{input_dir}/func_dir"
 
-  boldref: "/path/to/sub-*_ses-*_task-rest_boldref.nii.gz"
-  refbold: "/path/to/sub-*_ses-*_task-rest_boldref.nii.gz"
-  refbold_mni: "/path/to/sub-*_ses-*_task-rest_space-{mni_type_res}_boldref.nii.gz"
+# NO NEED for user to edit below assuming data is in BIDS format
+  mask_anat: "{anat_dir}/sub-*_ses-*_desc-brain_mask.nii.gz"
+  mask_func: "{func_dir}/sub-*_ses-*_task-rest_desc-brain_mask.nii.gz"
 
-  gm_seg: "/path/to/sub-*_ses-*_label-GM_probseg.nii.gz"
+  boldref: "{func_dir}/sub-*_ses-*_task-rest_boldref.nii.gz"
+  refbold: "{func_dir}/sub-*_ses-*_task-rest_boldref.nii.gz"
+  refbold_mni: "{func_dir}/sub-*_ses-*_task-rest_space-{mni_type_res}_boldref.nii.gz"
+
+  gm_seg: "{anat_dir}/sub-*_ses-*_label-GM_probseg.nii.gz"
 
 settings:
   gm_threshold: 0.3
