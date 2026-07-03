@@ -1,0 +1,27 @@
+paths:
+  tmp_dir: "path/to/tmp_dir"
+
+  # Reference images
+  mni: "/path/to/MNI_template.nii.gz"
+  mni_mask: "/path/to/MNI_mask.nii.gz"
+  mni_type_res: "MNI152NLin2009cAsym_res-2"
+  
+outputs:
+  extracted_metrics_file: "/path/to/extracted_metrics.csv"
+
+inputs:
+  anat_dir: "/path/to/anat_dir"
+
+  mask_anat: "/path/to/sub-*_ses-*_desc-brain_mask.nii.gz"
+  mask_func: "/path/to/sub-*_ses-*_task-rest_desc-brain_mask.nii.gz"
+
+  boldref: "/path/to/sub-*_ses-*_task-rest_boldref.nii.gz"
+  refbold: "/path/to/sub-*_ses-*_task-rest_boldref.nii.gz"
+  refbold_mni: "/path/to/sub-*_ses-*_task-rest_space-{mni_type_res}_boldref.nii.gz"
+
+  gm_seg: "/path/to/sub-*_ses-*_label-GM_probseg.nii.gz"
+
+settings:
+  gm_threshold: 0.3
+  dropout_percentile: 10
+  mattes_bins: 64
