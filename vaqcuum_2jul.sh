@@ -2,18 +2,18 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: vaqcuum --fmriprep --output_space <MNI|mni> -i <input_dir> -o <output_dir>"
+    echo "Usage: vaqcuum --fmriprep -i <input_dir> -o <output_dir> --config_file <config.yaml>"
 }
 
-if [[ "$#" -lt 6 ]]; then
+if [[ "$#" -lt 7 ]]; then
     usage
     exit 1
 fi
 
 mode=""
-output_space=""
 input_dir=""
 output_dir=""
+config_file=""
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -22,19 +22,9 @@ while [[ "$#" -gt 0 ]]; do
             shift
             ;;
 
-        --output_space)
+        -i|--input|--i)
             if [[ "$#" -lt 2 ]]; then
-                echo "ERROR: --output_space requires a value." >&2
-                usage
-                exit 1
-            fi
-            output_space="$2"
-            shift 2
-            ;;
-
-        -i|--input)
-            if [[ "$#" -lt 2 ]]; then
-                echo "ERROR: -i/--input requires a directory." >&2
+                echo "ERROR: -i/--i requires an input directory." >&2
                 usage
                 exit 1
             fi
@@ -44,11 +34,21 @@ while [[ "$#" -gt 0 ]]; do
 
         -o|--output)
             if [[ "$#" -lt 2 ]]; then
-                echo "ERROR: -o/--output requires a directory." >&2
+                echo "ERROR: -o requires an output directory." >&2
                 usage
                 exit 1
             fi
             output_dir="$2"
+            shift 2
+            ;;
+
+        --config_file)
+            if [[ "$#" -lt 2 ]]; then
+                echo "ERROR: --config_file requires a YAML file." >&2
+                usage
+                exit 1
+            fi
+            config_file="$2"
             shift 2
             ;;
 
@@ -71,26 +71,20 @@ if [[ "$mode" != "fmriprep" ]]; then
     exit 1
 fi
 
-if [[ -z "$output_space" ]]; then
-    echo "ERROR: You must specify --output_space <MNI|mni>." >&2
-    usage
-    exit 1
-fi
-
-if [[ "$output_space" != "MNI" && "$output_space" != "mni" ]]; then
-    echo "ERROR: --output_space must be either MNI or mni." >&2
-    usage
-    exit 1
-fi
-
 if [[ -z "$input_dir" ]]; then
-    echo "ERROR: You must specify an input directory with -i or --input." >&2
+    echo "ERROR: You must specify an input directory with -i." >&2
     usage
     exit 1
 fi
 
 if [[ -z "$output_dir" ]]; then
-    echo "ERROR: You must specify an output directory with -o or --output." >&2
+    echo "ERROR: You must specify an output directory with -o." >&2
+    usage
+    exit 1
+fi
+
+if [[ -z "$config_file" ]]; then
+    echo "ERROR: You must specify a config file with --config_file." >&2
     usage
     exit 1
 fi
@@ -105,9 +99,28 @@ if [[ ! -d "$output_dir" ]]; then
     exit 1
 fi
 
+if [[ ! -f "$config_file" ]]; then
+    echo "ERROR: Config file does not exist or is not a file: $config_file" >&2
+    exit 1
+fi
+
+case "$config_file" in
+    *.yaml|*.yml)
+        ;;
+    *)
+        echo "ERROR: Config file must have .yaml or .yml extension: $config_file" >&2
+        exit 1
+        ;;
+esac
+
 echo "Running vaqcuum on fMRIPrep input:"
 echo "  Input directory:  $input_dir"
 echo "  Output directory: $output_dir"
-echo "  Output space:     $output_space"
+echo "  Config file:      $config_file"
 
-bash runner.sh "$input_dir" "$output_dir" "$output_space"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+bash "$script_dir/runner.sh" \
+    "$input_dir" \
+    "$output_dir" \
+    "$config_file"
