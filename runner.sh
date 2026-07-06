@@ -1,11 +1,3 @@
-#### NOTE FOR FUTURE SELF:
-# DROPOUT IS IN MNI SPACE
-
-# NEED TO TRANSFORM BOLDREF FROM NATIVE TO T1 SPACE AND COMPUTE MASKED NMI ON THAT
-# BESIDED THE NMI IN MNI SPACE
-
-
-
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -149,6 +141,34 @@ find_single_file() {
     echo "$result"
 }
 
+find_single_dir() {
+    local search_dir="$1"
+    local path_suffix="$2"
+    local label="$3"
+
+    local result
+    result=$(find "$search_dir" -type d -path "*/$path_suffix" | sort)
+
+    local count
+    count=$(echo "$result" | sed '/^$/d' | wc -l | awk '{print $1}')
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "ERROR: No directory found for $label." >&2
+        echo "  Search dir: $search_dir" >&2
+        echo "  Suffix:     $path_suffix" >&2
+        exit 1
+    elif [[ "$count" -gt 1 ]]; then
+        echo "ERROR: Multiple directories found for $label." >&2
+        echo "  Search dir: $search_dir" >&2
+        echo "  Suffix:     $path_suffix" >&2
+        echo "Matches:" >&2
+        echo "$result" >&2
+        exit 1
+    fi
+
+    echo "$result"
+}
+
 extract_sub_id() {
     local file="$1"
     local base
@@ -242,11 +262,15 @@ check_dependencies() {
     require_command yq
     require_command fslstats
     require_command fslmaths
-    require_command python3
+    require_command python
 
     require_command antsApplyTransforms
     require_command MeasureImageSimilarity
     require_command ImageIntensityStatistics
+
+    python - <<'PY'
+import pandas
+PY
 }
 
 check_inputs_global() {
@@ -275,7 +299,17 @@ check_inputs_global() {
 # ============================================================
 
 initialize_outputs() {
-    echo "sub_id,ses_id,dice_val,volume_gm,nvox_gm,intensity_gm,volume_dropout,nvox_dropout,intensity_dropout,mattes_t1_bold,mattes_wt1_mni,mattes_wbold_mni,entropy_t1,entropy_bold,entropy_wt1,entropy_wbold,entropy_mni" > "$extracted_metrics_file"
+    metrics_dir="$tmp_dir/metrics"
+
+    dice_dir="$metrics_dir/dice"
+    dropout_dir="$metrics_dir/dropout"
+    nmi_dir="$metrics_dir/nmi"
+
+    rm -rf "$metrics_dir"
+
+    mkdir -p "$dice_dir"
+    mkdir -p "$dropout_dir"
+    mkdir -p "$nmi_dir"
 }
 
 # ============================================================
@@ -337,49 +371,52 @@ resolve_subject_session_inputs() {
         "$derivative_pattern" \
         "derivative directory for $sub_id $ses_id")
 
-    anat_dir=$(resolve_glob_one \
-        "$derivative_dir/$sub_id/$ses_id/anat" \
+    anat_dir=$(find_single_dir \
+        "$derivative_dir" \
+        "$sub_id/$ses_id/anat" \
         "anatomical directory for $sub_id $ses_id")
 
-    func_dir=$(resolve_glob_one \
-        "$derivative_dir/$sub_id/$ses_id/func" \
+    func_dir=$(find_single_dir \
+        "$derivative_dir" \
+        "$sub_id/$ses_id/func" \
         "functional directory for $sub_id $ses_id")
 
-    # Native-space anatomical brain mask.
     mask_anat=$(find_single_file \
         "$anat_dir" \
         "${sub_id}_${ses_id}_*desc-brain_mask.nii.gz" \
         "$mni_type_res")
 
-    # MNI-space functional brain mask.
-    mask_func=$(find_single_file \
+    mask_anat_mni=$(find_single_file \
+        "$anat_dir" \
+        "${sub_id}_${ses_id}_space-${mni_type_res}*_desc-brain_mask.nii.gz")
+
+    mask_func_mni=$(find_single_file \
         "$func_dir" \
         "${sub_id}_${ses_id}_task-rest*_space-${mni_type_res}*_desc-brain_mask.nii.gz")
 
-    # Native-space BOLD reference.
     refbold=$(find_single_file \
         "$func_dir" \
-        "${sub_id}_${ses_id}_task-rest*_boldref.nii.gz" \
+        "${sub_id}_${ses_id}_task-rest*_desc-coreg_boldref.nii.gz" \
         "$mni_type_res")
 
-    # MNI-space BOLD reference.
     refbold_mni=$(find_single_file \
         "$func_dir" \
         "${sub_id}_${ses_id}_task-rest*_space-${mni_type_res}*_boldref.nii.gz")
 
-    # Native-space gray matter segmentation.
-    gm_seg=$(find_single_file \
+    gm_seg_mni=$(find_single_file \
         "$anat_dir" \
-        "${sub_id}_${ses_id}_label-GM_probseg.nii.gz")
+        "${sub_id}_${ses_id}_*space-${mni_type_res}*label-GM_probseg.nii.gz")
 
+    echo "#============================================================" >&2
     echo "  derivative_dir: $derivative_dir" >&2
     echo "  anat_dir:       $anat_dir" >&2
     echo "  func_dir:       $func_dir" >&2
-    echo "  mask_anat:      $mask_anat" >&2
-    echo "  mask_func:      $mask_func" >&2
+    echo "  mask_anat_mni:  $mask_anat_mni" >&2
+    echo "  mask_func_mni:  $mask_func_mni" >&2
     echo "  refbold:        $refbold" >&2
     echo "  refbold_mni:    $refbold_mni" >&2
-    echo "  gm_seg:         $gm_seg" >&2
+    echo "  gm_seg_mni:     $gm_seg_mni" >&2
+    echo "#============================================================" >&2
 }
 
 # ============================================================
@@ -389,8 +426,8 @@ resolve_subject_session_inputs() {
 extract_dice_metric() {
     local sub_id="$1"
     local ses_id="$2"
-    local anat_mask="$3"
-    local func_mask="$4"
+    local anat_mask_mni="$3"
+    local func_mask_mni="$4"
 
     local intersection
     intersection="$tmp_dir/${sub_id}_${ses_id}_mask_intersection.nii.gz"
@@ -399,13 +436,16 @@ extract_dice_metric() {
     local func_voxels
     local intersection_voxels
     local dice_val
+    local metric_file
+
+    metric_file="$dice_dir/${sub_id}_${ses_id}.csv"
 
     echo "Computing Dice for $sub_id $ses_id" >&2
 
-    anat_voxels=$(fslstats "$anat_mask" -V | awk '{print $1}')
-    func_voxels=$(fslstats "$func_mask" -V | awk '{print $1}')
+    anat_voxels=$(fslstats "$anat_mask_mni" -V | awk '{print $1}')
+    func_voxels=$(fslstats "$func_mask_mni" -V | awk '{print $1}')
 
-    fslmaths "$anat_mask" -mul "$func_mask" "$intersection"
+    fslmaths "$anat_mask_mni" -mul "$func_mask_mni" "$intersection"
 
     intersection_voxels=$(fslstats "$intersection" -V | awk '{print $1}')
 
@@ -413,7 +453,10 @@ extract_dice_metric() {
 
     rm -f "$intersection"
 
-    echo "$dice_val"
+    {
+        echo "sub_id,ses_id,dice_val"
+        echo "$sub_id,$ses_id,$dice_val"
+    } > "$metric_file"
 }
 
 # ============================================================
@@ -424,8 +467,8 @@ extract_dropout_metric() {
     local sub_id="$1"
     local ses_id="$2"
     local gm_seg_file="$3"
-    local anat_mask="$4"
-    local func_mask="$5"
+    local anat_mask_mni="$4"
+    local func_mask_mni="$5"
     local refbold_mni_file="$6"
 
     local mask_gm_thr
@@ -435,6 +478,9 @@ extract_dropout_metric() {
     local new_mask_func_inv
     local mask_dropout
     local mask_gm_thr_clean
+    local metric_file
+
+    metric_file="$dropout_dir/${sub_id}_${ses_id}.csv"
 
     mask_gm_thr="$tmp_dir/${sub_id}_${ses_id}_gm_thr.nii.gz"
     mask_merged="$tmp_dir/${sub_id}_${ses_id}_merged_mask.nii.gz"
@@ -450,8 +496,8 @@ extract_dropout_metric() {
         -thr "$gm_threshold" \
         -bin "$mask_gm_thr"
 
-    fslmaths "$anat_mask" \
-        -add "$func_mask" \
+    fslmaths "$anat_mask_mni" \
+        -add "$func_mask_mni" \
         -thr 1 \
         -bin "$mask_merged"
 
@@ -503,37 +549,82 @@ extract_dropout_metric() {
         "$refbold_masked" \
         "$new_mask_func_inv"
 
-    echo "$vol_gm,$nvox_gm,$intensity_gm,$vol_dropout,$nvox_dropout,$intensity_dropout"
+    {
+        echo "sub_id,ses_id,volume_gm,nvox_gm,intensity_gm,volume_dropout,nvox_dropout,intensity_dropout"
+        echo "$sub_id,$ses_id,$vol_gm,$nvox_gm,$intensity_gm,$vol_dropout,$nvox_dropout,$intensity_dropout"
+    } > "$metric_file"
 }
 
 # ============================================================
 # METRIC 3: MATTES / ENTROPY
 # ============================================================
 
-extract_nmi_metric() {
+transform_bold_t1space() {
     local sub_id="$1"
     local ses_id="$2"
     local anat_directory="$3"
-    local refbold_file="$4"
-    local refbold_mni_file="$5"
+    local func_directory="$4"
+    local refbold_file="$5"
 
+    local bold_t1space
     local t1
-    local t1_mask
-    local wt1
+    local matrix
 
-    # Native-space T1w.
+    bold_t1space="${tmp_dir}/${sub_id}_${ses_id}_space-T1w_desc-coreg_boldref.nii.gz"
+
     t1=$(find_single_file \
         "$anat_directory" \
         "${sub_id}_${ses_id}_*desc-preproc_T1w.nii.gz" \
         "$mni_type_res")
 
-    # Native-space T1w brain mask.
+    matrix=$(find_single_file \
+        "$func_directory" \
+        "${sub_id}_${ses_id}*from-boldref_to-T1w_mode-image_desc-coreg_xfm.txt" \
+        "$mni_type_res")
+
+    echo "Transforming BOLD reference to T1w space for $sub_id $ses_id" >&2
+    echo "  refbold: $refbold_file" >&2
+    echo "  t1:      $t1" >&2
+    echo "  matrix:  $matrix" >&2
+    echo "  output:  $bold_t1space" >&2
+
+    antsApplyTransforms \
+        -d 3 \
+        -i "$refbold_file" \
+        -r "$t1" \
+        -o "$bold_t1space" \
+        -t "$matrix" \
+        --interpolation LanczosWindowedSinc \
+        >&2
+
+    echo "$bold_t1space"
+}
+
+extract_nmi_metric() {
+    local sub_id="$1"
+    local ses_id="$2"
+    local anat_directory="$3"
+    local refbold_t1space="$4"
+    local refbold_mni_file="$5"
+    local entropy_mni="$6"
+
+    local t1
+    local t1_mask
+    local wt1
+    local metric_file
+
+    metric_file="$nmi_dir/${sub_id}_${ses_id}.csv"
+
+    t1=$(find_single_file \
+        "$anat_directory" \
+        "${sub_id}_${ses_id}_*desc-preproc_T1w.nii.gz" \
+        "$mni_type_res")
+
     t1_mask=$(find_single_file \
         "$anat_directory" \
         "${sub_id}_${ses_id}_*desc-brain_mask.nii.gz" \
         "$mni_type_res")
 
-    # MNI-space T1w.
     wt1=$(find_single_file \
         "$anat_directory" \
         "${sub_id}_${ses_id}_*space-${mni_type_res}*_desc-preproc_T1w.nii.gz")
@@ -541,7 +632,7 @@ extract_nmi_metric() {
     local t1_mask_bold_space
     local t1_resampled
 
-    t1_mask_bold_space="$tmp_dir/${sub_id}_${ses_id}_bold-space_T1wmask.nii.gz"
+    t1_mask_bold_space="${tmp_dir}/${sub_id}_${ses_id}_space-bold_desc-brain_T1wmask.nii.gz"
     t1_resampled="$tmp_dir/${sub_id}_${ses_id}_space-bold_T1w.nii.gz"
 
     echo "Computing Mattes / entropy metrics for $sub_id $ses_id" >&2
@@ -549,16 +640,18 @@ extract_nmi_metric() {
     antsApplyTransforms \
         -d 3 \
         -i "$t1_mask" \
-        -r "$refbold_file" \
+        -r "$refbold_t1space" \
         -o "$t1_mask_bold_space" \
-        -n NearestNeighbor
+        -n NearestNeighbor \
+        >&2
 
     antsApplyTransforms \
         -d 3 \
         -i "$t1" \
-        -r "$refbold_file" \
+        -r "$refbold_t1space" \
         -o "$t1_resampled" \
-        -n BSpline
+        -n BSpline \
+        >&2
 
     local mattes_t1_bold
     local mattes_wt1_mni
@@ -566,7 +659,7 @@ extract_nmi_metric() {
 
     mattes_t1_bold=$(MeasureImageSimilarity \
         -d 3 \
-        -m Mattes["$t1_resampled","$refbold_file",1,"$mattes_bins"] \
+        -m Mattes["$t1_resampled","$refbold_t1space",1,"$mattes_bins"] \
         -x "$t1_mask_bold_space")
 
     mattes_wt1_mni=$(MeasureImageSimilarity \
@@ -586,16 +679,19 @@ extract_nmi_metric() {
     local entropy_mni
 
     entropy_t1=$(ImageIntensityStatistics 3 "$t1_resampled" "$t1_mask_bold_space" | awk 'NR==2 {print $6}')
-    entropy_bold=$(ImageIntensityStatistics 3 "$refbold_file" "$t1_mask_bold_space" | awk 'NR==2 {print $6}')
+    entropy_bold=$(ImageIntensityStatistics 3 "$refbold_t1space" "$t1_mask_bold_space" | awk 'NR==2 {print $6}')
     entropy_wt1=$(ImageIntensityStatistics 3 "$wt1" "$mni_mask" | awk 'NR==2 {print $6}')
     entropy_wbold=$(ImageIntensityStatistics 3 "$refbold_mni_file" "$mni_mask" | awk 'NR==2 {print $6}')
     entropy_mni=$(ImageIntensityStatistics 3 "$mni" "$mni_mask" | awk 'NR==2 {print $6}')
 
     echo "$sub_id $ses_id | Mattes T1/BOLD: $mattes_t1_bold | wT1/MNI: $mattes_wt1_mni | wBOLD/MNI: $mattes_wbold_mni" >&2
-
+    echo "$sub_id $ses_id | Entropy T1: $entropy_t1 | BOLD: $entropy_bold | wT1: $entropy_wt1 | wBOLD: $entropy_wbold | MNI: $entropy_mni" >&2
     rm -f "$t1_mask_bold_space" "$t1_resampled"
 
-    echo "$mattes_t1_bold,$mattes_wt1_mni,$mattes_wbold_mni,$entropy_t1,$entropy_bold,$entropy_wt1,$entropy_wbold,$entropy_mni"
+    {
+        echo "sub_id,ses_id,mattes_t1_bold,mattes_wt1_mni,mattes_wbold_mni,entropy_t1,entropy_bold,entropy_wt1,entropy_wbold,entropy_mni"
+        echo "$sub_id,$ses_id,$mattes_t1_bold,$mattes_wt1_mni,$mattes_wbold_mni,$entropy_t1,$entropy_bold,$entropy_wt1,$entropy_wbold,$entropy_mni"
+    } > "$metric_file"
 }
 
 # ============================================================
@@ -614,48 +710,184 @@ process_subject_session() {
     resolve_subject_session_inputs
 
     check_matching_ids \
-        "$mask_anat" \
-        "$mask_func" \
+        "$mask_anat_mni" \
+        "$mask_func_mni" \
         "$refbold" \
         "$refbold_mni" \
-        "$gm_seg"
+        "$gm_seg_mni"
 
-    local dice_val
-    local dropout_values
-    local nmi_values
-    local row_file
-
-    dice_val=$(extract_dice_metric \
+    extract_dice_metric \
         "$sub_id" \
         "$ses_id" \
-        "$mask_anat" \
-        "$mask_func")
+        "$mask_anat_mni" \
+        "$mask_func_mni"
 
-    dropout_values=$(extract_dropout_metric \
+    extract_dropout_metric \
         "$sub_id" \
         "$ses_id" \
-        "$gm_seg" \
-        "$mask_anat" \
-        "$mask_func" \
-        "$refbold_mni")
+        "$gm_seg_mni" \
+        "$mask_anat_mni" \
+        "$mask_func_mni" \
+        "$refbold_mni"
 
-    nmi_values=$(extract_nmi_metric \
+    local refbold_t1space
+
+    refbold_t1space=$(transform_bold_t1space \
         "$sub_id" \
         "$ses_id" \
         "$anat_dir" \
-        "$refbold" \
-        "$refbold_mni")
+        "$func_dir" \
+        "$refbold")
 
-    row_file="$tmp_dir/rows/${sub_id}_${ses_id}.csvrow"
-
-    echo "$sub_id,$ses_id,$dice_val,$dropout_values,$nmi_values" > "$row_file"
+    extract_nmi_metric \
+        "$sub_id" \
+        "$ses_id" \
+        "$anat_dir" \
+        "$refbold_t1space" \
+        "$refbold_mni" \
+        "$entropy_mni"
 
     echo "Finished $sub_id $ses_id" >&2
+}
+
+compute_nmi_merge_metrics() {
+    python - "$dice_dir" "$dropout_dir" "$nmi_dir" "$extracted_metrics_file" <<'PY'
+import sys
+from pathlib import Path
+import pandas as pd
+import numpy as np
+
+dice_dir, dropout_dir, nmi_dir, output_file = map(Path, sys.argv[1:5])
+
+keys = ["sub_id", "ses_id"]
+
+def read_metric_dir(metric_dir: Path, label: str) -> pd.DataFrame:
+    files = sorted(metric_dir.glob("*.csv"))
+
+    if not files:
+        raise SystemExit(f"ERROR: No CSV files found for {label}: {metric_dir}")
+
+    frames = []
+    for file in files:
+        df = pd.read_csv(file)
+
+        if df.empty:
+            raise SystemExit(f"ERROR: Empty CSV file for {label}: {file}")
+
+        frames.append(df)
+
+    out = pd.concat(frames, ignore_index=True)
+
+    duplicates = out[out.duplicated(keys, keep=False)]
+    if not duplicates.empty:
+        raise SystemExit(
+            f"ERROR: Duplicate sub_id/ses_id rows found in {label} metrics:\n"
+            f"{duplicates.to_string(index=False)}"
+        )
+
+    return out
+
+
+def numeric_col(df: pd.DataFrame, col: str) -> pd.Series:
+    if col not in df.columns:
+        raise SystemExit(f"ERROR: Missing required NMI column: {col}")
+
+    return pd.to_numeric(df[col], errors="coerce")
+
+
+def safe_nmi(entropy_a: pd.Series, entropy_b: pd.Series, joint_term: pd.Series) -> pd.Series:
+    out = (entropy_a + entropy_b) / joint_term
+    out = out.replace([np.inf, -np.inf], np.nan)
+    return out
+
+
+dice = read_metric_dir(dice_dir, "dice")
+dropout = read_metric_dir(dropout_dir, "dropout")
+nmi_raw = read_metric_dir(nmi_dir, "nmi")
+
+# Compute NMI from entropy terms and Mattes/joint term.
+nmi = nmi_raw[keys].copy()
+
+nmi["nmi_t1_bold"] = safe_nmi(
+    numeric_col(nmi_raw, "entropy_t1"),
+    numeric_col(nmi_raw, "entropy_bold"),
+    numeric_col(nmi_raw, "mattes_t1_bold"),
+)
+
+nmi["nmi_wt1_mni"] = safe_nmi(
+    numeric_col(nmi_raw, "entropy_wt1"),
+    numeric_col(nmi_raw, "entropy_mni"),
+    numeric_col(nmi_raw, "mattes_wt1_mni"),
+)
+
+nmi["nmi_wbold_mni"] = safe_nmi(
+    numeric_col(nmi_raw, "entropy_wbold"),
+    numeric_col(nmi_raw, "entropy_mni"),
+    numeric_col(nmi_raw, "mattes_wbold_mni"),
+)
+
+merged = (
+    dice
+    .merge(dropout, on=keys, how="outer", validate="one_to_one")
+    .merge(nmi, on=keys, how="outer", validate="one_to_one")
+)
+
+merged = merged.sort_values(keys).reset_index(drop=True)
+
+output_file.parent.mkdir(parents=True, exist_ok=True)
+merged.to_csv(output_file, index=False)
+
+print(f"Wrote merged metrics to: {output_file}", file=sys.stderr)
+PY
 }
 
 # ============================================================
 # RUN DATASET
 # ============================================================
+export_parallel_context() {
+    export config_file
+
+    export tmp_dir
+    export output_dir
+    export extracted_metrics_file
+
+    export input_dir
+    export derivative_dir_template
+
+    export mni
+    export mni_mask
+    export mni_type_res
+
+    export gm_threshold
+    export dropout_percentile
+    export mattes_bins
+
+    export metrics_dir
+    export dice_dir
+    export dropout_dir
+    export nmi_dir
+
+    export -f require_command
+    export -f require_file
+    export -f require_dir
+    export -f read_yaml
+    export -f expand_config_vars
+    export -f resolve_glob_one
+    export -f find_single_file
+    export -f find_single_dir
+    export -f extract_sub_id
+    export -f extract_ses_id
+    export -f split_subject_session_id
+    export -f check_matching_ids
+    export -f resolve_subject_session_inputs
+
+    export -f extract_dice_metric
+    export -f extract_dropout_metric
+    export -f transform_bold_t1space
+    export -f extract_nmi_metric
+    export -f process_subject_session
+}
+
 
 run_dataset() {
     local subject_sessions=()
@@ -666,38 +898,17 @@ run_dataset() {
 
     echo "Found ${#subject_sessions[@]} subject/session IDs." >&2
 
-    rm -f "$tmp_dir/rows/"*.csvrow 2>/dev/null || true
-
-    local sub_ses_id
-    local running_jobs
-
-    for sub_ses_id in "${subject_sessions[@]}"; do
-        process_subject_session "$sub_ses_id" &
-
-        while true; do
-            running_jobs=$(jobs -rp | wc -l | awk '{print $1}')
-
-            if [[ "$running_jobs" -lt "$n_jobs" ]]; then
-                break
-            fi
-
-            sleep 1
-        done
-    done
-
-    wait
-
-    echo "Combining metric rows into $extracted_metrics_file" >&2
-
     initialize_outputs
+    export_parallel_context
 
-    find "$tmp_dir/rows" \
-        -type f \
-        -name "*.csvrow" \
-        | sort \
-        | while IFS= read -r row_file; do
-            cat "$row_file" >> "$extracted_metrics_file"
-        done
+    printf '%s\n' "${subject_sessions[@]}" | parallel \
+        --jobs "$n_jobs" \
+        --halt soon,fail=1 \
+        --line-buffer \
+        --joblog "$tmp_dir/parallel_joblog.tsv" \
+        process_subject_session {}
+
+    compute_nmi_merge_metrics
 }
 
 # ============================================================

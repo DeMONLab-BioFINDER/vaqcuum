@@ -5,7 +5,7 @@ paths:
 
   # Reference images
   mni: "/Users/ga0034de/Downloads/templateflow/tpl-MNI152NLin6Asym/tpl-MNI152NLin6Asym_res-02_T1w.nii.gz"
-  mni_mask: "/Users/ga0034de/Downloads/templateflow/tpl-MNI152NLin6Asym/tpl-MNI152NLin6Asym_res-02_desc-brain_T1w.nii.gz"
+  mni_mask: "/Users/ga0034de/Downloads/templateflow/tpl-MNI152NLin6Asym/tpl-MNI152NLin6Asym_res-02_desc-brain_mask.nii.gz"
   mni_type_res: "MNI152NLin6Asym_res-2"
   
 outputs:
@@ -24,5 +24,3 @@ settings:
   dropout_percentile: 10
   mattes_bins: 64
   n_jobs: 4
-
-  
