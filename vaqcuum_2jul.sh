@@ -1,3 +1,7 @@
+#### note to self:
+# need to add --output-space
+# and session type: multi or single session
+
 #!/usr/bin/env bash
 set -euo pipefail
 
