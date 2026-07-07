@@ -21,10 +21,15 @@ inputs:
 
 # If you want to focus on specific acquisitions or tasks, you can specify them here. 
 # Otherwise, leave them empty to include all
-filtering:
-  acquisition: ""
-  task: ""
-
+bids_filters:
+  t1w:
+    acquisition: "*"
+  bold:
+    task: "rest"
+    # if multiple tasks, write them as a list
+    # e.g. 
+    #- task: "rest"
+    #- task: "baloon"
 
 settings:
   gm_threshold: 0.3

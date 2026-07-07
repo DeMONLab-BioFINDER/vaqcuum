@@ -2,6 +2,15 @@
 set -euo pipefail
 
 # ============================================================
+# SOURCING FUNCTIONS
+# ============================================================
+
+source ./utils.sh
+source ./bids_filter.sh
+source ./metrics.sh
+
+
+# ============================================================
 # CONFIGURATION
 # ============================================================
 
@@ -57,6 +66,7 @@ read_config() {
 
 check_dependencies() {
     require_command yq
+    require_command jq
     require_command fslstats
     require_command fslmaths
     require_command python
@@ -349,6 +359,8 @@ run_dataset() {
 main() {
     check_dependencies
     read_config
+    bids_filter_json="$tmp_dir/bids_filter.json"
+    create_bids_filter_json "$config_file" "$bids_filter_json" >&2
     check_inputs_global
     run_dataset
 }
