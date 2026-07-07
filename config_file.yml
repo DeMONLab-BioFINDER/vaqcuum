@@ -1,34 +1,43 @@
 # user action: Configure the paths and settings for the vaqcuum pipeline
 
 paths:
-  tmp_dir: "path/to/tmp_dir"
+  tmp_dir: "/Users/ga0034de/Desktop/test_temp"
 
   # Reference images
-  mni: "/path/to/MNI_template.nii.gz"
-  mni_mask: "/path/to/MNI_mask.nii.gz"
-  mni_type_res: "MNI152NLin2009cAsym_res-2"
+  mni: "/Users/ga0034de/Downloads/templateflow/tpl-MNI152NLin6Asym/tpl-MNI152NLin6Asym_res-02_T1w.nii.gz"
+  mni_mask: "/Users/ga0034de/Downloads/templateflow/tpl-MNI152NLin6Asym/tpl-MNI152NLin6Asym_res-02_desc-brain_mask.nii.gz"
+  mni_type_res: "MNI152NLin6Asym_res-2"
   
 outputs:
-  output_dir: "/path/to/output_dir"
-  extracted_metrics_file: "/path/to/extracted_metrics.csv"
+  output_dir: "/Users/ga0034de/Desktop/test_output"
+  extracted_metrics_file: "{output_dir}/extracted_metrics.csv"
 
 inputs:
-  input_dir: "/path/to/input_dir"
+  input_dir: "/Users/ga0034de/Desktop/test_fmriprepdset"
 
-  anat_dir: "{input_dir}/anat_dir"
-  func_dir: "{input_dir}/func_dir"
+  # Options for specifying the derivative directory structure:
+  # "{input_dir}/{sub_id}_{ses_id}_fmriprep*" (flat)
+  # or "{input_dir}/{sub_id}/{ses_id}" (nested)
+  derivative_structure: "{input_dir}/{sub_id}/{ses_id}"
+  #"{input_dir}/{sub_id}_{ses_id}_fmriprep*"
+  
+  # if your nested derivative structure has processed anat scans in the first session folder only (fmriprep's design), set this to "yes". If not, set to "no"
+  anat_earliest_ses: "no"
 
-# NO NEED for user to edit below assuming data is in BIDS format
-  mask_anat: "{anat_dir}/sub-*_ses-*_desc-brain_mask.nii.gz"
-  mask_func: "{func_dir}/sub-*_ses-*_task-rest_desc-brain_mask.nii.gz"
 
-  boldref: "{func_dir}/sub-*_ses-*_task-rest_boldref.nii.gz"
-  refbold: "{func_dir}/sub-*_ses-*_task-rest_boldref.nii.gz"
-  refbold_mni: "{func_dir}/sub-*_ses-*_task-rest_space-{mni_type_res}_boldref.nii.gz"
+bids_filters:
+  # If you want to focus on specific acquisitions or tasks, you can specify them here. 
+  # Otherwise, leave them empty to include all
+  # if null, type "null" and that string wont be considered. Else wildcard * considers all
 
-  gm_seg: "{anat_dir}/sub-*_ses-*_label-GM_probseg.nii.gz"
+  t1w:
+    acquisition: "null"
+  bold:
+    task: "rest"
+    acquisition: "*"
 
 settings:
   gm_threshold: 0.3
   dropout_percentile: 10
   mattes_bins: 64
+  n_jobs: 4

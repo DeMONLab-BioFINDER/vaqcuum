@@ -13,12 +13,12 @@ outputs:
   extracted_metrics_file: "{output_dir}/extracted_metrics.csv"
 
 inputs:
-  input_dir: "/Users/ga0034de/Desktop/test_fmriprepdset"
+  input_dir: "/Volumes/research/LU26D1023-DemonLab/DemonLab/ROSMAP/derivatives/fmriprep/unzipped"
 
   # Options for specifying the derivative directory structure:
   # "{input_dir}/{sub_id}_{ses_id}_fmriprep*" (flat)
   # or "{input_dir}/{sub_id}/{ses_id}" (nested)
-  derivative_structure: "{input_dir}/{sub_id}/{ses_id}"
+  derivative_structure: "{input_dir}/{sub_id}_{ses_id}_fmriprep*"
   #"{input_dir}/{sub_id}_{ses_id}_fmriprep*"
   
   # if your nested derivative structure has processed anat scans in the first session folder only (fmriprep's design), set this to "yes". If not, set to "no"

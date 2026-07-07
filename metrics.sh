@@ -11,7 +11,7 @@ extract_dice_metric() {
     local func_mask_mni="$4"
 
     local intersection
-    intersection="$tmp_dir/${sub_id}_${ses_id}_mask_intersection.nii.gz"
+    intersection="$id_tmp_dir/${sub_id}_${ses_id}_mask_intersection.nii.gz"
 
     local anat_voxels
     local func_voxels
@@ -63,13 +63,13 @@ extract_dropout_metric() {
 
     metric_file="$dropout_dir/${sub_id}_${ses_id}.csv"
 
-    mask_gm_thr="$tmp_dir/${sub_id}_${ses_id}_gm_thr.nii.gz"
-    mask_merged="$tmp_dir/${sub_id}_${ses_id}_merged_mask.nii.gz"
-    refbold_masked="$tmp_dir/${sub_id}_${ses_id}_desc-mask_boldref.nii.gz"
-    new_mask_func="$tmp_dir/${sub_id}_${ses_id}_new_func_mask.nii.gz"
-    new_mask_func_inv="$tmp_dir/${sub_id}_${ses_id}_new_func_mask_inv.nii.gz"
-    mask_dropout="$tmp_dir/${sub_id}_${ses_id}_dropout_mask.nii.gz"
-    mask_gm_thr_clean="$tmp_dir/${sub_id}_${ses_id}_gm_thr_clean.nii.gz"
+    mask_gm_thr="$id_tmp_dir/${sub_id}_${ses_id}_gm_thr.nii.gz"
+    mask_merged="$id_tmp_dir/${sub_id}_${ses_id}_merged_mask.nii.gz"
+    refbold_masked="$id_tmp_dir/${sub_id}_${ses_id}_desc-mask_boldref.nii.gz"
+    new_mask_func="$id_tmp_dir/${sub_id}_${ses_id}_new_func_mask.nii.gz"
+    new_mask_func_inv="$id_tmp_dir/${sub_id}_${ses_id}_new_func_mask_inv.nii.gz"
+    mask_dropout="$id_tmp_dir/${sub_id}_${ses_id}_dropout_mask.nii.gz"
+    mask_gm_thr_clean="$id_tmp_dir/${sub_id}_${ses_id}_gm_thr_clean.nii.gz"
 
     echo "Computing dropout for $sub_id $ses_id" >&2
 
@@ -151,7 +151,7 @@ transform_bold_t1space() {
     local t1
     local matrix
 
-    bold_t1space="${tmp_dir}/${sub_id}_${ses_id}_space-T1w_desc-coreg_boldref.nii.gz"
+    bold_t1space="${id_tmp_dir}/${sub_id}_${ses_id}_space-T1w_desc-coreg_boldref.nii.gz"
 
     t1=$(find_single_file \
         "$anat_directory" \
@@ -213,8 +213,8 @@ extract_nmi_metric() {
     local t1_mask_bold_space
     local t1_resampled
 
-    t1_mask_bold_space="${tmp_dir}/${sub_id}_${ses_id}_space-bold_desc-brain_T1wmask.nii.gz"
-    t1_resampled="$tmp_dir/${sub_id}_${ses_id}_space-bold_T1w.nii.gz"
+    t1_mask_bold_space="${id_tmp_dir}/${sub_id}_${ses_id}_space-bold_desc-brain_T1wmask.nii.gz"
+    t1_resampled="$id_tmp_dir/${sub_id}_${ses_id}_space-bold_T1w.nii.gz"
 
     echo "Computing Mattes / entropy metrics for $sub_id $ses_id" >&2
 

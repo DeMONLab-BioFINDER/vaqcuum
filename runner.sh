@@ -145,17 +145,18 @@ discover_subject_session_paths() {
     local output_csv="$1"
     local tmp_csv="${output_csv}.tmp"
 
-    local uses_flat_structure=0
-    local uses_nested_structure=0
+    local discovery_pattern
+    local structure
 
     rm -f "$tmp_csv"
+
     echo "Discovering subject/session paths from: $input_dir" >&2
     echo "Template: $derivative_dir_template" >&2
 
     if [[ "$derivative_dir_template" == *"{sub_id}_{ses_id}"* ]]; then
-        uses_flat_structure=1
+        structure="flat"
     elif [[ "$derivative_dir_template" == *"{sub_id}/{ses_id}"* ]]; then
-        uses_nested_structure=1
+        structure="nested"
     else
         echo "ERROR: derivative_dir must contain either:" >&2
         echo '  {sub_id}_{ses_id}' >&2
@@ -165,36 +166,43 @@ discover_subject_session_paths() {
         exit 1
     fi
 
-    echo "Discovering subject/session paths from: $input_dir" >&2
-    echo "Template: $derivative_dir_template" >&2
+    discovery_pattern="$derivative_dir_template"
+    discovery_pattern="${discovery_pattern//\{input_dir\}/$input_dir}"
+    discovery_pattern="${discovery_pattern//\{sub_id\}/sub-*}"
+    discovery_pattern="${discovery_pattern//\{ses_id\}/ses-*}"
 
-    if [[ "$uses_flat_structure" -eq 1 ]]; then
-        echo "Using flat structure discovery: sub-*_ses-*" >&2
+    echo "Discovery pattern: $discovery_pattern" >&2
+    echo "Detected structure: $structure" >&2
 
-        find "$input_dir" \
-            -maxdepth 1 \
-            -type d \
-            -name "sub-*_ses-*" \
-            -printf '%f\n' 2>/dev/null \
+    if [[ "$structure" == "flat" ]]; then
+        compgen -G "$discovery_pattern" \
+            | sort \
+            | while IFS= read -r derivative_path; do
+                local base
+                base=$(basename "$derivative_path")
+
+                if [[ "$base" =~ ^(sub-[^_]+)_(ses-[^_]+).* ]]; then
+                    echo "$base"
+                else
+                    echo "WARNING: Could not parse flat subject/session from: $derivative_path" >&2
+                fi
+            done \
             | sort -u > "$tmp_csv"
 
-    elif [[ "$uses_nested_structure" -eq 1 ]]; then
-        echo "Using nested structure discovery: sub-*/ses-*" >&2
-
-        find "$input_dir" \
-            -mindepth 2 \
-            -maxdepth 2 \
-            -type d \
-            -path "*/sub-*/ses-*" \
-            | while IFS= read -r ses_dir; do
+    elif [[ "$structure" == "nested" ]]; then
+        compgen -G "$discovery_pattern" \
+            | sort \
+            | while IFS= read -r derivative_path; do
                 local ses_id
                 local sub_id
 
-                ses_id=$(basename "$ses_dir")
-                sub_id=$(basename "$(dirname "$ses_dir")")
+                ses_id=$(basename "$derivative_path")
+                sub_id=$(basename "$(dirname "$derivative_path")")
 
                 if [[ "$sub_id" == sub-* && "$ses_id" == ses-* ]]; then
                     echo "${sub_id}/${ses_id}"
+                else
+                    echo "WARNING: Could not parse nested subject/session from: $derivative_path" >&2
                 fi
             done \
             | sort -u > "$tmp_csv"
@@ -204,8 +212,9 @@ discover_subject_session_paths() {
         echo "ERROR: No subject/session paths discovered." >&2
         echo "Input dir: $input_dir" >&2
         echo "Template:  $derivative_dir_template" >&2
+        echo "Pattern:   $discovery_pattern" >&2
         echo "Debug: first few directories under input_dir:" >&2
-        find "$input_dir" -maxdepth 3 -type d | head -50 >&2
+        find "$input_dir" -maxdepth 3 -type d | sort | head -50 >&2
         rm -f "$tmp_csv"
         exit 1
     fi
@@ -334,6 +343,16 @@ process_subject_session() {
 
     split_subject_session_path "$sub_ses_path"
 
+    id_tmp_dir="$tmp_dir/work/${sub_id}_${ses_id}"
+    rm -rf "$id_tmp_dir"
+    mkdir -p "$id_tmp_dir"
+
+    cleanup_subject_tmp() {
+        rm -rf "$id_tmp_dir"
+    }
+
+    trap cleanup_subject_tmp RETURN
+
     echo "============================================================" >&2
     echo "Processing $sub_id $ses_id" >&2
     echo "============================================================" >&2
@@ -421,7 +440,7 @@ export_parallel_context() {
     export bold_pattern
     export bids_filter_json
     export -f bids_filter_pattern
-    
+
     export -f require_command
     export -f require_file
     export -f require_dir
