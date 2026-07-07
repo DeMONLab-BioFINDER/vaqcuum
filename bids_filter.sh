@@ -42,3 +42,81 @@ create_bids_filter_json() {
 
     echo "$output_json"
 }
+
+bids_filter_get() {
+    local entity="$1"
+    local key="$2"
+    local default="${3:-*}"
+
+    jq -r \
+        --arg entity "$entity" \
+        --arg key "$key" \
+        --arg default "$default" \
+        '.[$entity][$key] // $default' \
+        "$bids_filter_json"
+}
+
+bids_optional_entity_pattern() {
+    local key="$1"
+    local value="$2"
+
+    if [[ -z "$value" || "$value" == "null" ]]; then
+        echo ""
+    else
+        echo "${key}-${value}_"
+    fi
+}
+
+bids_filter_pattern() {
+    local modality="$1"
+
+    python - "$bids_filter_json" "$modality" <<'PY'
+import json
+import sys
+
+json_file = sys.argv[1]
+modality = sys.argv[2]
+
+with open(json_file) as f:
+    filters = json.load(f)
+
+entity_map = {
+    "acquisition": "acq",
+    "reconstruction": "rec",
+    "direction": "dir",
+    "task": "task",
+    "run": "run",
+    "echo": "echo",
+    "space": "space",
+    "desc": "desc",
+    "label": "label",
+}
+
+skip_keys = {"datatype", "suffix"}
+
+items = filters.get(modality, {})
+
+parts = []
+
+for key, value in items.items():
+    if key in skip_keys:
+        continue
+
+    if value is None:
+        continue
+
+    value = str(value)
+
+    if value in ("", "null", "None", "~"):
+        continue
+
+    bids_key = entity_map.get(key, key)
+
+    parts.append(f"{bids_key}-{value}")
+
+if parts:
+    print("_".join(parts) + "_")
+else:
+    print("")
+PY
+}

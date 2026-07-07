@@ -206,3 +206,47 @@ check_matching_ids() {
     done
 }
 
+check_matching_subjects() {
+    local expected_sub="$1"
+    shift
+
+    local file
+    local file_sub
+
+    for file in "$@"; do
+        file_sub=$(extract_sub_id "$file")
+
+        if [[ "$file_sub" != "$expected_sub" ]]; then
+            echo "ERROR: Subject mismatch detected." >&2
+            echo "Expected: $expected_sub" >&2
+            echo "File:     $file -> $file_sub" >&2
+            exit 1
+        fi
+    done
+}
+
+get_earliest_anat_dir() {
+    local subject_dir="$1"
+    local label="$2"
+
+    local anat_dirs=()
+
+    while IFS= read -r dir; do
+        anat_dirs+=("$dir")
+    done < <(
+        find "$subject_dir" \
+            -mindepth 2 \
+            -maxdepth 2 \
+            -type d \
+            -path "*/ses-*/anat" \
+            | sort
+    )
+
+    if [[ "${#anat_dirs[@]}" -eq 0 ]]; then
+        echo "ERROR: No anat directory found for $label." >&2
+        echo "  Subject dir: $subject_dir" >&2
+        exit 1
+    fi
+
+    echo "${anat_dirs[0]}"
+}

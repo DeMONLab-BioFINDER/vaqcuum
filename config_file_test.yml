@@ -15,21 +15,26 @@ outputs:
 inputs:
   input_dir: "/Users/ga0034de/Desktop/test_fmriprepdset"
 
-  # Folders like:
-  # sub-01_ses-01_fmriprep...
-  derivative_dir: "{input_dir}/{sub_id}_{ses_id}_fmriprep*"
+  # Options for specifying the derivative directory structure:
+  # "{input_dir}/{sub_id}_{ses_id}_fmriprep*" (flat)
+  # or "{input_dir}/{sub_id}/{ses_id}" (nested)
+  derivative_structure: "{input_dir}/{sub_id}/{ses_id}"
+  #"{input_dir}/{sub_id}_{ses_id}_fmriprep*"
+  
+  # if your nested derivative structure has processed anat scans in the first session folder only (fmriprep's design), set this to "yes". If not, set to "no"
+  anat_earliest_ses: "no"
 
-# If you want to focus on specific acquisitions or tasks, you can specify them here. 
-# Otherwise, leave them empty to include all
+
 bids_filters:
+  # If you want to focus on specific acquisitions or tasks, you can specify them here. 
+  # Otherwise, leave them empty to include all
+  # if null, type "null" and that string wont be considered. Else wildcard * considers all
+
   t1w:
-    acquisition: "*"
+    acquisition: "null"
   bold:
     task: "rest"
-    # if multiple tasks, write them as a list
-    # e.g. 
-    #- task: "rest"
-    #- task: "baloon"
+    acquisition: "*"
 
 settings:
   gm_threshold: 0.3
