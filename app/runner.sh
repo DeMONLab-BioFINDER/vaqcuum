@@ -58,7 +58,7 @@ read_config() {
 
     mkdir -p "$tmp_dir"
     mkdir -p "$output_dir"
-    mkdir -p "$tmp_dir/rows"
+    #mkdir -p "$tmp_dir/rows"
 }
 
 read_bids_filter_values() {
@@ -436,9 +436,12 @@ export_parallel_context() {
     export dice_dir
     export dropout_dir
     export nmi_dir
+    export work_dir
+
     export t1w_pattern
     export bold_pattern
     export bids_filter_json
+
     export -f bids_filter_pattern
 
     export -f require_command
@@ -452,18 +455,16 @@ export_parallel_context() {
     export -f extract_sub_id
     export -f extract_ses_id
     export -f split_subject_session_path
-    export -f discover_subject_session_paths
     export -f check_matching_ids
-    export -f resolve_subject_session_inputs
-    export -f get_earliest_anat_dir
     export -f check_matching_subjects
+    export -f get_earliest_anat_dir
+    export -f resolve_subject_session_inputs
 
     export -f extract_dice_metric
     export -f extract_dropout_metric
     export -f transform_bold_t1space
     export -f extract_nmi_metric
     export -f process_subject_session
-    
 }
 
 
