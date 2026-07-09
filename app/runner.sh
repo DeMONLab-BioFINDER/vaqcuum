@@ -1,3 +1,19 @@
+## note to future self:
+
+# add task and acq to final csv
+# metrics should be extracted for all the spaces available in the dir
+# add space col in csv
+# should have an initial funciotn that does some 'exploration' and extracts data structure and info like space, acq, task, etc. and then use that to extract metrics
+# delete wbold-mni 
+# NMI between t1 and refbold is masked by the t1 based anat mask. no intersection and such
+# NMI in template space is masked by the template mask. no intersection and such
+# Dice in users space
+# dropout in users space
+# no bids filter
+# config file to minimum
+# fetch templateflow if not present
+# please provide path to template flow directory if no internet access. else leave empty and itll be fetched automatically from the net
+
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -54,7 +70,7 @@ read_config() {
     gm_threshold=$(read_yaml '.settings.gm_threshold')
     dropout_percentile=$(read_yaml '.settings.dropout_percentile')
     mattes_bins=$(read_yaml '.settings.mattes_bins')
-    n_jobs=$(read_yaml '.settings.n_jobs')
+    n_jobs=$(read_yaml '.parallelization.n_jobs')
 
     mkdir -p "$tmp_dir"
     mkdir -p "$output_dir"
@@ -138,201 +154,114 @@ initialize_outputs() {
 }
 
 # ============================================================
-# DISCOVER SUBJECT/SESSION IDS
-# ============================================================
-
-discover_subject_session_paths() {
-    local output_csv="$1"
-    local tmp_csv="${output_csv}.tmp"
-
-    local discovery_pattern
-    local structure
-
-    rm -f "$tmp_csv"
-
-    echo "Discovering subject/session paths from: $input_dir" >&2
-    echo "Template: $derivative_dir_template" >&2
-
-    if [[ "$derivative_dir_template" == *"{sub_id}_{ses_id}"* ]]; then
-        structure="flat"
-    elif [[ "$derivative_dir_template" == *"{sub_id}/{ses_id}"* ]]; then
-        structure="nested"
-    else
-        echo "ERROR: derivative_dir must contain either:" >&2
-        echo '  {sub_id}_{ses_id}' >&2
-        echo 'or:' >&2
-        echo '  {sub_id}/{ses_id}' >&2
-        echo "Current value: $derivative_dir_template" >&2
-        exit 1
-    fi
-
-    discovery_pattern="$derivative_dir_template"
-    discovery_pattern="${discovery_pattern//\{input_dir\}/$input_dir}"
-    discovery_pattern="${discovery_pattern//\{sub_id\}/sub-*}"
-    discovery_pattern="${discovery_pattern//\{ses_id\}/ses-*}"
-
-    echo "Discovery pattern: $discovery_pattern" >&2
-    echo "Detected structure: $structure" >&2
-
-    if [[ "$structure" == "flat" ]]; then
-        compgen -G "$discovery_pattern" \
-            | sort \
-            | while IFS= read -r derivative_path; do
-                local base
-                base=$(basename "$derivative_path")
-
-                if [[ "$base" =~ ^(sub-[^_]+)_(ses-[^_]+).* ]]; then
-                    echo "$base"
-                else
-                    echo "WARNING: Could not parse flat subject/session from: $derivative_path" >&2
-                fi
-            done \
-            | sort -u > "$tmp_csv"
-
-    elif [[ "$structure" == "nested" ]]; then
-        compgen -G "$discovery_pattern" \
-            | sort \
-            | while IFS= read -r derivative_path; do
-                local ses_id
-                local sub_id
-
-                ses_id=$(basename "$derivative_path")
-                sub_id=$(basename "$(dirname "$derivative_path")")
-
-                if [[ "$sub_id" == sub-* && "$ses_id" == ses-* ]]; then
-                    echo "${sub_id}/${ses_id}"
-                else
-                    echo "WARNING: Could not parse nested subject/session from: $derivative_path" >&2
-                fi
-            done \
-            | sort -u > "$tmp_csv"
-    fi
-
-    if [[ ! -s "$tmp_csv" ]]; then
-        echo "ERROR: No subject/session paths discovered." >&2
-        echo "Input dir: $input_dir" >&2
-        echo "Template:  $derivative_dir_template" >&2
-        echo "Pattern:   $discovery_pattern" >&2
-        echo "Debug: first few directories under input_dir:" >&2
-        find "$input_dir" -maxdepth 3 -type d | sort | head -50 >&2
-        rm -f "$tmp_csv"
-        exit 1
-    fi
-
-    {
-        echo "sub_ses_path"
-        cat "$tmp_csv"
-    } > "$output_csv"
-
-    rm -f "$tmp_csv"
-}
-
-split_subject_session_path() {
-    local sub_ses_path="$1"
-
-    if [[ "$sub_ses_path" =~ ^(sub-[^/]+)/(ses-[^/]+)$ ]]; then
-        sub_id="${BASH_REMATCH[1]}"
-        ses_id="${BASH_REMATCH[2]}"
-
-    elif [[ "$sub_ses_path" =~ ^(sub-[^_]+)_(ses-[^_]+).* ]]; then
-        sub_id="${BASH_REMATCH[1]}"
-        ses_id="${BASH_REMATCH[2]}"
-
-    else
-        echo "ERROR: Could not parse subject/session path: $sub_ses_path" >&2
-        exit 1
-    fi
-}
-
-# ============================================================
 # SUBJECT/SESSION FILE RESOLUTION
 # ============================================================
 
 resolve_subject_session_inputs() {
     echo "Resolving files for $sub_id $ses_id" >&2
 
-    local derivative_pattern
-    derivative_pattern=$(expand_config_vars "$derivative_dir_template")
+    ```
+    local session_key
+    session_key="${sub_id}_${ses_id}"
 
-    derivative_dir=$(resolve_glob_one \
-        "$derivative_pattern" \
-        "derivative directory for $sub_id $ses_id")
+    local anat_dir func_dir
+    anat_dir=$(jq -r --arg key "$session_key" '.session_summary[$key].anat.path // empty' "$dataset_summary_json")
+    func_dir=$(jq -r --arg key "$session_key" '.session_summary[$key].func.path // empty' "$dataset_summary_json")
 
-    if [[ "$derivative_dir" == */"$sub_id"/"$ses_id" ]]; then
-    # Nested structure:
-    # {input_dir}/{sub_id}/{ses_id}
-
-        local subject_dir
-        subject_dir="$(dirname "$derivative_dir")"
-
-        if [[ "$anat_earliest_ses" == "yes" ]]; then
-            anat_dir=$(get_earliest_anat_dir \
-                "$subject_dir" \
-                "$sub_id")
-        else
-            anat_dir=$(resolve_glob_one \
-                "$derivative_dir/anat" \
-                "anatomical directory for $sub_id $ses_id")
-        fi
-
-        func_dir=$(resolve_glob_one \
-            "$derivative_dir/func" \
-            "functional directory for $sub_id $ses_id")
-
-    else
-        # Flat fMRIPrep-like structure:
-        # {input_dir}/{sub_id}_{ses_id}_fmriprep*
-
-        anat_dir=$(find_single_dir \
-            "$derivative_dir" \
-            "$sub_id/$ses_id/anat" \
-            "anatomical directory for $sub_id $ses_id")
-
-        func_dir=$(find_single_dir \
-            "$derivative_dir" \
-            "$sub_id/$ses_id/func" \
-            "functional directory for $sub_id $ses_id")
+    if [[ -z "$anat_dir" || -z "$func_dir" ]]; then
+        echo "ERROR: Could not read anat/func paths from JSON for $session_key" >&2
+        exit 1
     fi
 
-    anat_ses_id=$(basename "$(dirname "$anat_dir")")
-    
+    local func_task func_acq func_space
+    func_task=$(jq -r --arg key "$session_key" '.session_summary[$key].func.task // empty' "$dataset_summary_json")
+    func_acq=$(jq -r --arg key "$session_key" '.session_summary[$key].func.acq // empty' "$dataset_summary_json")
+    func_space=$(jq -r --arg key "$session_key" '.session_summary[$key].func.space // empty' "$dataset_summary_json")
+
+    local anat_acq anat_space
+    anat_acq=$(jq -r --arg key "$session_key" '.session_summary[$key].anat.acq // empty' "$dataset_summary_json")
+    anat_space=$(jq -r --arg key "$session_key" '.session_summary[$key].anat.space // empty' "$dataset_summary_json")
+
+    local anat_prefix func_prefix
+    anat_prefix="${sub_id}_${ses_id}"
+    func_prefix="${sub_id}_${ses_id}"
+
+    if [[ -n "$anat_acq" ]]; then
+        anat_acq_string="_acq-${anat_acq}"
+    else
+        acq_string=""
+    fi
+
+    if [[ -n "$anat_space" ]]; then
+        anat_space_string="_space-${anat_space}"
+    else
+        anat_space_string=""
+    fi
+
+    if [[ -n "$func_task" ]]; then
+        task_prefix="_task-${func_task}"
+    else
+        task_prefix=""
+    fi
+
+    if [[ -n "$func_acq" ]]; then
+        func_acq_string="_acq-${func_acq}"
+    else
+        func_acq_string=""
+    fi
+
+    if [[ -n "$func_space" ]]; then
+        func_space_string="_space-${func_space}"
+    else
+        func_space_string=""
+    fi
+
+    # if anat_space contains MNI, then call it mni_type_res
+    if [[ "$anat_space" == *"MNI"* ]]; then
+        mni_type_res="$anat_space"
+    fi
+
     mask_anat=$(find_single_file \
-    "$anat_dir" \
-        "${sub_id}_${anat_ses_id}_${t1w_pattern}*desc-brain_mask.nii.gz" \
+        "$anat_dir" \
+        "${session_key}*${anat_acq_string}*desc-brain_mask.nii.gz" \
         "$mni_type_res")
 
     mask_anat_mni=$(find_single_file \
         "$anat_dir" \
-        "${sub_id}_${anat_ses_id}_${t1w_pattern}*space-${mni_type_res}*_desc-brain_mask.nii.gz")
+        "${session_key}*${anat_acq_string}*${anat_space_string}*_desc-brain_mask.nii.gz")
 
     gm_seg_mni=$(find_single_file \
         "$anat_dir" \
-        "${sub_id}_${anat_ses_id}_${t1w_pattern}*space-${mni_type_res}*label-GM_probseg.nii.gz")
+        "${session_key}*${anat_acq_string}*${anat_space_string}*label-GM_probseg.nii.gz")
 
     mask_func_mni=$(find_single_file \
         "$func_dir" \
-        "${sub_id}_${ses_id}_${bold_pattern}*space-${mni_type_res}*_desc-brain_mask.nii.gz")
+        "${func_prefix}*${task_prefix}*${func_acq_string}*${func_space_string}*desc-brain_mask.nii.gz")
 
     refbold=$(find_single_file \
         "$func_dir" \
-        "${sub_id}_${ses_id}_${bold_pattern}*desc-coreg_boldref.nii.gz" \
+        "${session_key}*${task_prefix}*${func_acq_string}*desc-coreg_boldref.nii.gz" \
         "$mni_type_res")
 
-    refbold_mni=$(find_single_file \
-        "$func_dir" \
-        "${sub_id}_${ses_id}_${bold_pattern}*space-${mni_type_res}*_boldref.nii.gz")
+    # refbold_mni=$(find_single_file \
+    #     "$func_dir" \
+    #     "${func_prefix}*space-${mni_type_res}*_boldref.nii.gz")
 
     echo "#============================================================" >&2
-    echo "  derivative_dir: $derivative_dir" >&2
+    echo "  session_key:    $session_key" >&2
     echo "  anat_dir:       $anat_dir" >&2
     echo "  func_dir:       $func_dir" >&2
+    echo "  anat_prefix:    $anat_prefix" >&2
+    echo "  func_prefix:    $func_prefix" >&2
     echo "  mask_anat_mni:  $mask_anat_mni" >&2
     echo "  mask_func_mni:  $mask_func_mni" >&2
     echo "  refbold:        $refbold" >&2
-    echo "  refbold_mni:    $refbold_mni" >&2
+    #echo "  refbold_mni:    $refbold_mni" >&2
     echo "  gm_seg_mni:     $gm_seg_mni" >&2
     echo "#============================================================" >&2
-}
+    ```
+
+    }
 
 # ============================================================
 # PROCESS ONE SUBJECT/SESSION
@@ -341,7 +270,8 @@ resolve_subject_session_inputs() {
 process_subject_session() {
     local sub_ses_path="$1"
 
-    split_subject_session_path "$sub_ses_path"
+    sub_id=$(printf '%s\n' "$sub_ses_path" | grep -oE 'sub-[^_/]+' | head -n1)
+    ses_id=$(printf '%s\n' "$sub_ses_path" | grep -oE 'ses-[^_/]+' | head -n1)
 
     id_tmp_dir="$tmp_dir/work/${sub_id}_${ses_id}"
     rm -rf "$id_tmp_dir"
@@ -404,7 +334,7 @@ process_subject_session() {
         "$ses_id" \
         "$anat_dir" \
         "$refbold_t1space" \
-        "$refbold_mni" \
+        #"$refbold_mni" \
         "$entropy_mni"
 
     echo "Finished $sub_id $ses_id" >&2
@@ -441,6 +371,7 @@ export_parallel_context() {
     export t1w_pattern
     export bold_pattern
     export bids_filter_json
+    export dataset_summary_json
 
     export -f bids_filter_pattern
 
@@ -454,7 +385,6 @@ export_parallel_context() {
     export -f find_single_dir
     export -f extract_sub_id
     export -f extract_ses_id
-    export -f split_subject_session_path
     export -f check_matching_ids
     export -f check_matching_subjects
     export -f get_earliest_anat_dir
@@ -470,9 +400,24 @@ export_parallel_context() {
 
 run_dataset() {
     local subject_session_paths_csv
-    subject_session_paths_csv="$tmp_dir/subject_session_paths.csv"
+    local dataset_summary_json
 
-    discover_subject_session_paths "$subject_session_paths_csv"
+    subject_session_paths_csv="$tmp_dir/subject_session_paths.csv"
+    dataset_summary_json="$tmp_dir/dataset_summary.json"
+    
+    # New Python-based exploration step
+    python "$(dirname "$0")/dataset_utils.py" "$input_dir" > "$dataset_summary_json"
+    cat "$dataset_summary_json" >&2
+    # Build the session list from the exploration output
+    jq -r '
+      .session_summary
+      | keys[]
+    ' "$dataset_summary_json" | sort > "$subject_session_paths_csv"
+
+    {
+        echo "sub_ses_path"
+        cat "$subject_session_paths_csv"
+    } > "$subject_session_paths_csv.tmp" && mv "$subject_session_paths_csv.tmp" "$subject_session_paths_csv"
 
     echo "Discovered subject/session paths:" >&2
     cat "$subject_session_paths_csv" >&2
@@ -498,11 +443,11 @@ main() {
     check_dependencies
     read_config
 
-    bids_filter_json="$tmp_dir/bids_filter.json"
-    create_bids_filter_json "$config_file" "$bids_filter_json" >&2
+    # bids_filter_json="$tmp_dir/bids_filter.json"
+    # create_bids_filter_json "$config_file" "$bids_filter_json" >&2
 
-    t1w_pattern=$(bids_filter_pattern "t1w")
-    bold_pattern=$(bids_filter_pattern "bold")
+    # t1w_pattern=$(bids_filter_pattern "t1w")
+    # bold_pattern=$(bids_filter_pattern "bold")
 
     check_inputs_global
     run_dataset

@@ -61,6 +61,17 @@ extract_dropout_metric() {
     local mask_gm_thr_clean
     local metric_file
 
+    local thresh
+    local vol_dropout
+    local nvox_dropout
+    local vol_gm
+    local nvox_gm
+    local intensity_gm
+    local intensity_dropout
+    local dropout_intensity
+    local dropout_size
+    local dropout_compo
+
     metric_file="$dropout_dir/${sub_id}_${ses_id}.csv"
 
     mask_gm_thr="$id_tmp_dir/${sub_id}_${ses_id}_gm_thr.nii.gz"
@@ -86,8 +97,12 @@ extract_dropout_metric() {
         -mul "$mask_merged" \
         "$refbold_masked"
 
-    local thresh
     thresh=$(fslstats "$refbold_masked" -l 0.001 -P "$dropout_percentile" 2>/dev/null | awk '{print $1}')
+
+    if [[ -z "$thresh" || "$thresh" == "nan" || "$thresh" == "NaN" ]]; then
+        echo "ERROR: Could not calculate dropout threshold for $sub_id $ses_id" >&2
+        exit 1
+    fi
 
     echo "Dropout threshold for $sub_id $ses_id: $thresh" >&2
 
@@ -102,13 +117,6 @@ extract_dropout_metric() {
         -mul "$new_mask_func_inv" \
         "$mask_dropout"
 
-    local vol_dropout
-    local nvox_dropout
-    local vol_gm
-    local nvox_gm
-    local intensity_gm
-    local intensity_dropout
-
     vol_dropout=$(fslstats "$mask_dropout" -V | awk '{print $2}')
     nvox_dropout=$(fslstats "$mask_dropout" -V | awk '{print $1}')
 
@@ -122,7 +130,49 @@ extract_dropout_metric() {
     intensity_gm=$(fslstats "$refbold_mni_file" -k "$mask_gm_thr_clean" -M)
     intensity_dropout=$(fslstats "$refbold_mni_file" -k "$mask_dropout" -M)
 
-    echo "$sub_id $ses_id | GM: $vol_gm $intensity_gm | Dropout: $vol_dropout $intensity_dropout" >&2
+    dropout_intensity=$(python3 - "$intensity_dropout" "$intensity_gm" <<'PY'
+import sys
+import math
+
+numerator = float(sys.argv[1])
+denominator = float(sys.argv[2])
+
+if denominator == 0 or math.isnan(denominator):
+    print("nan")
+else:
+    print(numerator / denominator)
+PY
+)
+
+    dropout_size=$(python3 - "$vol_dropout" "$vol_gm" <<'PY'
+import sys
+import math
+
+numerator = float(sys.argv[1])
+denominator = float(sys.argv[2])
+
+if denominator == 0 or math.isnan(denominator):
+    print("nan")
+else:
+    print(numerator / denominator)
+PY
+)
+
+    dropout_compo=$(python3 - "$dropout_intensity" "$dropout_size" <<'PY'
+import sys
+import math
+
+dropout_intensity = float(sys.argv[1])
+dropout_size = float(sys.argv[2])
+
+if math.isnan(dropout_intensity) or math.isnan(dropout_size):
+    print("nan")
+else:
+    print((1 - dropout_intensity) + dropout_size)
+PY
+)
+
+    echo "$sub_id $ses_id | GM: $vol_gm $intensity_gm | Dropout: $vol_dropout $intensity_dropout | Composite: $dropout_compo" >&2
 
     rm -f \
         "$mask_gm_thr_clean" \
@@ -131,8 +181,8 @@ extract_dropout_metric() {
         "$new_mask_func_inv"
 
     {
-        echo "sub_id,ses_id,volume_gm,nvox_gm,intensity_gm,volume_dropout,nvox_dropout,intensity_dropout"
-        echo "$sub_id,$ses_id,$vol_gm,$nvox_gm,$intensity_gm,$vol_dropout,$nvox_dropout,$intensity_dropout"
+        echo "sub_id,ses_id,volume_gm,nvox_gm,intensity_gm,volume_dropout,nvox_dropout,intensity_dropout,dropout_intensity,dropout_size,dropout_compo"
+        echo "$sub_id,$ses_id,$vol_gm,$nvox_gm,$intensity_gm,$vol_dropout,$nvox_dropout,$intensity_dropout,$dropout_intensity,$dropout_size,$dropout_compo"
     } > "$metric_file"
 }
 
@@ -236,42 +286,39 @@ extract_nmi_metric() {
 
     local mattes_t1_bold
     local mattes_wt1_mni
-    local mattes_wbold_mni
 
     mattes_t1_bold=$(MeasureImageSimilarity \
         -d 3 \
         -m Mattes["$t1_resampled","$refbold_t1space",1,"$mattes_bins"] \
-        -x "$t1_mask_bold_space")
+        -x "$t1_mask")
 
     mattes_wt1_mni=$(MeasureImageSimilarity \
         -d 3 \
         -m Mattes["$wt1","$mni",1,"$mattes_bins"] \
         -x "$mni_mask")
 
-    mattes_wbold_mni=$(MeasureImageSimilarity \
-        -d 3 \
-        -m Mattes["$refbold_mni_file","$mni",1,"$mattes_bins"] \
-        -x "$mni_mask")
+    # mattes_wbold_mni=$(MeasureImageSimilarity \
+    #     -d 3 \
+    #     -m Mattes["$refbold_mni_file","$mni",1,"$mattes_bins"] \
+    #     -x "$mni_mask")
 
     local entropy_t1
     local entropy_bold
     local entropy_wt1
-    local entropy_wbold
     local entropy_mni
 
     entropy_t1=$(ImageIntensityStatistics 3 "$t1_resampled" "$t1_mask_bold_space" | awk 'NR==2 {print $6}')
     entropy_bold=$(ImageIntensityStatistics 3 "$refbold_t1space" "$t1_mask_bold_space" | awk 'NR==2 {print $6}')
     entropy_wt1=$(ImageIntensityStatistics 3 "$wt1" "$mni_mask" | awk 'NR==2 {print $6}')
-    entropy_wbold=$(ImageIntensityStatistics 3 "$refbold_mni_file" "$mni_mask" | awk 'NR==2 {print $6}')
     entropy_mni=$(ImageIntensityStatistics 3 "$mni" "$mni_mask" | awk 'NR==2 {print $6}')
 
-    echo "$sub_id $ses_id | Mattes T1/BOLD: $mattes_t1_bold | wT1/MNI: $mattes_wt1_mni | wBOLD/MNI: $mattes_wbold_mni" >&2
-    echo "$sub_id $ses_id | Entropy T1: $entropy_t1 | BOLD: $entropy_bold | wT1: $entropy_wt1 | wBOLD: $entropy_wbold | MNI: $entropy_mni" >&2
+    echo "$sub_id $ses_id | Mattes T1/BOLD: $mattes_t1_bold | wT1/MNI: $mattes_wt1_mni" >&2
+    echo "$sub_id $ses_id | Entropy T1: $entropy_t1 | BOLD: $entropy_bold | wT1: $entropy_wt1 | MNI: $entropy_mni" >&2
     rm -f "$t1_mask_bold_space" "$t1_resampled"
 
     {
-        echo "sub_id,ses_id,mattes_t1_bold,mattes_wt1_mni,mattes_wbold_mni,entropy_t1,entropy_bold,entropy_wt1,entropy_wbold,entropy_mni"
-        echo "$sub_id,$ses_id,$mattes_t1_bold,$mattes_wt1_mni,$mattes_wbold_mni,$entropy_t1,$entropy_bold,$entropy_wt1,$entropy_wbold,$entropy_mni"
+        echo "sub_id,ses_id,mattes_t1_bold,mattes_wt1_mni,entropy_t1,entropy_bold,entropy_wt1,entropy_mni"
+        echo "$sub_id,$ses_id,$mattes_t1_bold,$mattes_wt1_mni,$entropy_t1,$entropy_bold,$entropy_wt1,$entropy_mni"
     } > "$metric_file"
 }
 
@@ -328,6 +375,30 @@ def safe_nmi(entropy_a: pd.Series, entropy_b: pd.Series, joint_term: pd.Series) 
 
 dice = read_metric_dir(dice_dir, "dice")
 dropout = read_metric_dir(dropout_dir, "dropout")
+
+required_dropout_cols = [
+    "intensity_dropout",
+    "intensity_gm",
+    "volume_dropout",
+    "volume_gm",
+]
+
+for col in required_dropout_cols:
+    if col not in dropout.columns:
+        raise SystemExit(f"ERROR: Missing required dropout column: {col}")
+
+for col in required_dropout_cols:
+    dropout[col] = pd.to_numeric(dropout[col], errors="coerce")
+
+dropout["dropout_intensity"] = dropout["intensity_dropout"] / dropout["intensity_gm"]
+dropout["dropout_size"] = dropout["volume_dropout"] / dropout["volume_gm"]
+dropout["dropout_compo"] = (1 - dropout["dropout_intensity"]) + dropout["dropout_size"]
+
+dropout = dropout.replace([np.inf, -np.inf], np.nan)
+
+# Keep only this dropout metric in the final merged CSV
+dropout = dropout[keys + ["dropout_compo"]].copy()
+
 nmi_raw = read_metric_dir(nmi_dir, "nmi")
 
 # Compute NMI from entropy terms and Mattes/joint term.
@@ -345,11 +416,11 @@ nmi["nmi_wt1_mni"] = safe_nmi(
     numeric_col(nmi_raw, "mattes_wt1_mni"),
 )
 
-nmi["nmi_wbold_mni"] = safe_nmi(
-    numeric_col(nmi_raw, "entropy_wbold"),
-    numeric_col(nmi_raw, "entropy_mni"),
-    numeric_col(nmi_raw, "mattes_wbold_mni"),
-)
+# nmi["nmi_wbold_mni"] = safe_nmi(
+#     numeric_col(nmi_raw, "entropy_wbold"),
+#     numeric_col(nmi_raw, "entropy_mni"),
+#     numeric_col(nmi_raw, "mattes_wbold_mni"),
+# )
 
 merged = (
     dice

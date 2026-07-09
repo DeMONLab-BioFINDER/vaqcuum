@@ -3,6 +3,9 @@
 paths:
   tmp_dir: "/Users/ga0034de/Desktop/test_temp"
 
+  # if internet, fetch template flow
+  # provide templateflow path, then grep mni type from ders
+  
   # Reference images
   mni: "/Users/ga0034de/Downloads/templateflow/tpl-MNI152NLin6Asym/tpl-MNI152NLin6Asym_res-02_T1w.nii.gz"
   mni_mask: "/Users/ga0034de/Downloads/templateflow/tpl-MNI152NLin6Asym/tpl-MNI152NLin6Asym_res-02_desc-brain_mask.nii.gz"
@@ -13,18 +16,18 @@ outputs:
   extracted_metrics_file: "{output_dir}/extracted_metrics.csv"
 
 inputs:
-  input_dir: "/Volumes/research/LU26D1023-DemonLab/DemonLab/ROSMAP/derivatives/fmriprep/unzipped"
+  input_dir: "/Users/ga0034de/Desktop/test_fmriprepdset/_old"
 
   # Options for specifying the derivative directory structure:
   # "{input_dir}/{sub_id}_{ses_id}_fmriprep*" (flat)
   # or "{input_dir}/{sub_id}/{ses_id}" (nested)
-  derivative_structure: "{input_dir}/{sub_id}_{ses_id}_fmriprep*"
+  #derivative_structure: "{input_dir}/{sub_id}/{ses_id}"
   #"{input_dir}/{sub_id}_{ses_id}_fmriprep*"
   
   # if your nested derivative structure has processed anat scans in the first session folder only (fmriprep's design), set this to "yes". If not, set to "no"
   anat_earliest_ses: "no"
 
-
+## leave to user to do that
 bids_filters:
   # If you want to focus on specific acquisitions or tasks, you can specify them here. 
   # Otherwise, leave them empty to include all
@@ -33,11 +36,22 @@ bids_filters:
   t1w:
     acquisition: "null"
   bold:
-    task: "rest"
+    task: "rest" #make *
     acquisition: "*"
 
+
+
 settings:
+# parameters for metrics extraction should be hardcoded for now
   gm_threshold: 0.3
   dropout_percentile: 10
   mattes_bins: 64
+
+parallelization:
   n_jobs: 4
+
+  #should we also output scanwise metrics. 
+  # save or delete files?
+
+  #bids filter?
+  # if user didnt ask for native space, does nmi t1-boldref is performed in given space or do we transfrom to t1 space and then perform nmi t1-boldref, even tho user didnt ask for native space?

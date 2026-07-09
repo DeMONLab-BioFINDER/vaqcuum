@@ -7,6 +7,7 @@ set -euo pipefail
 # BASIC UTILITIES
 # ============================================================
 
+# Require a command to be available on PATH before continuing.
 require_command() {
     local cmd="$1"
 
@@ -16,6 +17,9 @@ require_command() {
     fi
 }
 
+# Find structure of the data, available spaces, tasks and acquisitions in the input directory.
+
+# Require a file to exist and stop with a clear error if it does not.
 require_file() {
     local file="$1"
     local label="$2"
@@ -26,6 +30,7 @@ require_file() {
     fi
 }
 
+# Require a directory to exist and stop with a clear error if it does not.
 require_dir() {
     local dir="$1"
     local label="$2"
@@ -36,11 +41,13 @@ require_dir() {
     fi
 }
 
+# Read a value from the YAML config file using yq.
 read_yaml() {
     local key="$1"
     yq -r "$key" "$config_file"
 }
 
+# Expand config placeholders like {tmp_dir} using current shell variables.
 expand_config_vars() {
     local value="$1"
 
@@ -63,6 +70,7 @@ expand_config_vars() {
     echo "$value"
 }
 
+# Resolve a glob pattern to exactly one match.
 resolve_glob_one() {
     local pattern="$1"
     local label="$2"
@@ -87,6 +95,7 @@ resolve_glob_one() {
     echo "${matches[0]}"
 }
 
+# Find exactly one file matching a name pattern, optionally excluding matches.
 find_single_file() {
     local search_dir="$1"
     local pattern="$2"
@@ -126,6 +135,7 @@ find_single_file() {
     echo "$result"
 }
 
+# Find exactly one directory with a path ending in the requested suffix.
 find_single_dir() {
     local search_dir="$1"
     local path_suffix="$2"
@@ -154,6 +164,7 @@ find_single_dir() {
     echo "$result"
 }
 
+# Extract the subject ID from a file name prefix before the first underscore.
 extract_sub_id() {
     local file="$1"
     local base
@@ -162,6 +173,7 @@ extract_sub_id() {
     echo "${base%%_*}"
 }
 
+# Extract the session ID from a file name segment after the subject prefix.
 extract_ses_id() {
     local file="$1"
     local base
@@ -172,6 +184,7 @@ extract_ses_id() {
     echo "${without_sub%%_*}"
 }
 
+# Split a combined subject-session ID into separate shell variables.
 split_subject_session_id() {
     local sub_ses_id="$1"
 
@@ -179,6 +192,7 @@ split_subject_session_id() {
     ses_id="ses-${sub_ses_id#*_ses-}"
 }
 
+# Verify that all files match the subject/session of a reference file.
 check_matching_ids() {
     local reference_file="$1"
     shift
@@ -206,6 +220,7 @@ check_matching_ids() {
     done
 }
 
+# Verify that all files belong to the expected subject.
 check_matching_subjects() {
     local expected_sub="$1"
     shift
@@ -225,6 +240,7 @@ check_matching_subjects() {
     done
 }
 
+# Return the earliest anat directory found under a subject directory.
 get_earliest_anat_dir() {
     local subject_dir="$1"
     local label="$2"
