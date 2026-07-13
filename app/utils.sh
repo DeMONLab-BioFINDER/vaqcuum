@@ -240,6 +240,39 @@ check_matching_subjects() {
     done
 }
 
+# fetch templateflow based on templates found
+fetch_templateflow() {
+    local template="$1"
+    local resolution="$2"
+
+    python - "$template" "$resolution" <<'PY'
+import sys
+from templateflow import api as tflow
+
+template = sys.argv[1]
+resolution = int(sys.argv[2]) if sys.argv[2] not in ("", "null", "None") else None
+
+path = tflow.get(
+    template,
+    resolution=resolution,
+    suffix="T1w",
+    extension=".nii.gz",
+    raise_empty=True,
+)
+
+mask = tflow.get(
+    template,
+    resolution=resolution,
+    suffix="mask",
+    extension=".nii.gz",
+    desc="brain",
+    raise_empty=True,
+)
+
+PY
+}
+
+
 # Return the earliest anat directory found under a subject directory.
 get_earliest_anat_dir() {
     local subject_dir="$1"

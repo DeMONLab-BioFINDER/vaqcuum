@@ -13,6 +13,7 @@
 # config file to minimum
 # fetch templateflow if not present
 # please provide path to template flow directory if no internet access. else leave empty and itll be fetched automatically from the net
+# 13.07 log out and err for each ID?
 
 #!/usr/bin/env bash
 set -euo pipefail
@@ -49,20 +50,23 @@ fi
 
 read_config() {
     tmp_dir=$(read_yaml '.paths.tmp_dir')
-    mni=$(read_yaml '.paths.mni')
-    mni_mask=$(read_yaml '.paths.mni_mask')
-    mni_type_res=$(read_yaml '.paths.mni_type_res')
+    # mni=$(read_yaml '.paths.mni')
+    # mni_mask=$(read_yaml '.paths.mni_mask')
+    # mni_type_res=$(read_yaml '.paths.mni_type_res')
 
-    output_dir=$(read_yaml '.outputs.output_dir')
-    extracted_metrics_file=$(read_yaml '.outputs.extracted_metrics_file')
+    output_dir=$(read_yaml '.paths.output_dir')
+    extracted_metrics_file=$(read_yaml '.paths.extracted_metrics_file')
 
-    input_dir=$(read_yaml '.inputs.input_dir')
-    derivative_dir_template=$(read_yaml '.inputs.derivative_structure')
-    anat_earliest_ses=$(read_yaml '.inputs.anat_earliest_ses // "no"')
+    input_dir=$(read_yaml '.paths.input_dir')
+
+    templateflow_dir=$(read_yaml '.paths.templateflow_dir')
+
+    # derivative_dir_template=$(read_yaml '.inputs.derivative_structure')
+    # anat_earliest_ses=$(read_yaml '.inputs.anat_earliest_ses // "no"')
 
     tmp_dir=$(expand_config_vars "$tmp_dir")
-    mni=$(expand_config_vars "$mni")
-    mni_mask=$(expand_config_vars "$mni_mask")
+    # mni=$(expand_config_vars "$mni")
+    # mni_mask=$(expand_config_vars "$mni_mask")
     output_dir=$(expand_config_vars "$output_dir")
     input_dir=$(expand_config_vars "$input_dir")
     extracted_metrics_file=$(expand_config_vars "$extracted_metrics_file")
@@ -109,8 +113,6 @@ PY
 
 check_inputs_global() {
     require_dir "$input_dir" "input"
-    require_file "$mni" "MNI template"
-    require_file "$mni_mask" "MNI mask"
 
     if [[ -z "$n_jobs" || "$n_jobs" == "null" ]]; then
         echo "ERROR: settings.n_jobs is missing from config." >&2
@@ -127,12 +129,6 @@ check_inputs_global() {
         exit 1
     fi
 
-    anat_earliest_ses=$(echo "$anat_earliest_ses" | tr '[:upper:]' '[:lower:]')
-
-    if [[ "$anat_earliest_ses" != "yes" && "$anat_earliest_ses" != "no" ]]; then
-        echo "ERROR: settings.anat_earliest_ses must be 'yes' or 'no'." >&2
-        exit 1
-    fi
 }
 
 # ============================================================
@@ -156,11 +152,26 @@ initialize_outputs() {
 # ============================================================
 # SUBJECT/SESSION FILE RESOLUTION
 # ============================================================
+cleanup_json_array() {
+    echo "$1" | jq -r '.[0] // empty'
+}
 
+clean_json_value() {
+    jq -r '
+        if type == "array" then
+            map(select(. != null)) | unique | .[0] // empty
+        elif . == null then
+            empty
+        else
+            .
+        end
+    '
+}
+
+# bash
 resolve_subject_session_inputs() {
     echo "Resolving files for $sub_id $ses_id" >&2
 
-    ```
     local session_key
     session_key="${sub_id}_${ses_id}"
 
@@ -186,10 +197,16 @@ resolve_subject_session_inputs() {
     anat_prefix="${sub_id}_${ses_id}"
     func_prefix="${sub_id}_${ses_id}"
 
+    anat_acq=$(cleanup_json_array "$anat_acq")
+    anat_space=$(cleanup_json_array "$anat_space")
+    func_acq=$(cleanup_json_array "$func_acq")
+    func_space=$(cleanup_json_array "$func_space")
+    func_task=$(cleanup_json_array "$func_task")
+
     if [[ -n "$anat_acq" ]]; then
         anat_acq_string="_acq-${anat_acq}"
     else
-        acq_string=""
+        anat_acq_string=""
     fi
 
     if [[ -n "$anat_space" ]]; then
@@ -216,19 +233,28 @@ resolve_subject_session_inputs() {
         func_space_string=""
     fi
 
-    # if anat_space contains MNI, then call it mni_type_res
-    if [[ "$anat_space" == *"MNI"* ]]; then
-        mni_type_res="$anat_space"
-    fi
+    anat_t1=$(find_single_file \
+        "$anat_dir" \
+        "${session_key}*${anat_acq_string}_*desc-preproc_T1w.nii.gz" \
+        "$anat_space")
 
     mask_anat=$(find_single_file \
         "$anat_dir" \
         "${session_key}*${anat_acq_string}*desc-brain_mask.nii.gz" \
-        "$mni_type_res")
+        "$anat_space")
+
+    anat_mni=$(find_single_file \
+        "$anat_dir" \
+        "${session_key}*${anat_acq_string}*${anat_space_string}*_desc-preproc_T1w.nii.gz")
 
     mask_anat_mni=$(find_single_file \
         "$anat_dir" \
         "${session_key}*${anat_acq_string}*${anat_space_string}*_desc-brain_mask.nii.gz")
+
+    matrix=$(find_single_file \
+        "$func_dir" \
+        "${session_key}*from-boldref_to-T1w_mode-image_desc-coreg_xfm.txt" \
+        "$anat_space")
 
     gm_seg_mni=$(find_single_file \
         "$anat_dir" \
@@ -241,27 +267,31 @@ resolve_subject_session_inputs() {
     refbold=$(find_single_file \
         "$func_dir" \
         "${session_key}*${task_prefix}*${func_acq_string}*desc-coreg_boldref.nii.gz" \
-        "$mni_type_res")
+        "$func_space")
 
-    # refbold_mni=$(find_single_file \
-    #     "$func_dir" \
-    #     "${func_prefix}*space-${mni_type_res}*_boldref.nii.gz")
+    refbold_mni=$(find_single_file \
+        "$func_dir" \
+        "${session_key}*${task_prefix}*${func_acq_string}*${func_space_string}*_boldref.nii.gz")
 
+    # debug output
     echo "#============================================================" >&2
     echo "  session_key:    $session_key" >&2
     echo "  anat_dir:       $anat_dir" >&2
     echo "  func_dir:       $func_dir" >&2
     echo "  anat_prefix:    $anat_prefix" >&2
     echo "  func_prefix:    $func_prefix" >&2
+    echo " "
+    echo "  anat_t1:        $anat_t1" >&2
+    echo "  mask_anat:      $mask_anat" >&2
+    echo "  anat_mni:       $anat_mni" >&2
     echo "  mask_anat_mni:  $mask_anat_mni" >&2
+    echo "  gm_seg_mni:     $gm_seg_mni" >&2
+    echo "  matrix:         $matrix" >&2
     echo "  mask_func_mni:  $mask_func_mni" >&2
     echo "  refbold:        $refbold" >&2
-    #echo "  refbold_mni:    $refbold_mni" >&2
-    echo "  gm_seg_mni:     $gm_seg_mni" >&2
+    echo "  refbold_mni:    $refbold_mni" >&2
     echo "#============================================================" >&2
-    ```
-
-    }
+}
 
 # ============================================================
 # PROCESS ONE SUBJECT/SESSION
@@ -325,19 +355,57 @@ process_subject_session() {
     refbold_t1space=$(transform_bold_t1space \
         "$sub_id" \
         "$ses_id" \
-        "$anat_dir" \
-        "$func_dir" \
+        "$anat_t1" \
+        "$matrix" \
         "$refbold")
 
     extract_nmi_metric \
         "$sub_id" \
         "$ses_id" \
-        "$anat_dir" \
+        "$anat_t1" \
+        "$mask_anat" \
         "$refbold_t1space" \
-        #"$refbold_mni" \
-        "$entropy_mni"
+        "$anat_mni" \
+        "$entropy_mni" ##!!!!
 
     echo "Finished $sub_id $ses_id" >&2
+}
+
+get_entropy_mni() {
+    local space="$1"
+    local resolution="$2"
+    local -n out_paths="$3"
+
+    if [[ -z "${templateflow_dir:-}" || "$templateflow_dir" == "null" ]]; then
+        echo "TemplateFlow directory not specified in config. Fetching from the internet..." >&2
+        templateflow_dir="$tmp_dir/templateflow"
+        mkdir -p "$templateflow_dir"
+        export TEMPLATEFLOW_HOME="$templateflow_dir"
+    else
+        echo "Using specified TemplateFlow directory: $templateflow_dir" >&2
+        export TEMPLATEFLOW_HOME="$templateflow_dir"
+    fi
+
+    fetch_templateflow "$space" "$res"
+
+    local key
+    key="${space}_res-0${res}"
+
+    out_paths["${key}_T1w"]=$(find_single_file \
+        "$templateflow_dir" \
+        "tpl-${space}_res-0${res}_T1w.nii.gz")
+
+    out_paths["${key}_mask"]=$(find_single_file \
+        "$templateflow_dir" \
+        "tpl-${space}_res-0${res}_desc-brain_mask.nii.gz")
+
+
+    local template_path template_mask_path entropy
+    template_path="${out_paths["${key}_T1w"]}"
+    template_mask_path="${out_paths["${key}_mask"]}"
+
+    entropy=$(ImageIntensityStatistics 3 "$template_path" "$template_mask_path" | awk 'NR==2 {print $6}')
+    echo "$entropy"
 }
 
 # ============================================================
@@ -367,6 +435,7 @@ export_parallel_context() {
     export dropout_dir
     export nmi_dir
     export work_dir
+    export entropy_values
 
     export t1w_pattern
     export bold_pattern
@@ -389,6 +458,7 @@ export_parallel_context() {
     export -f check_matching_subjects
     export -f get_earliest_anat_dir
     export -f resolve_subject_session_inputs
+    export -f cleanup_json_array
 
     export -f extract_dice_metric
     export -f extract_dropout_metric
@@ -405,10 +475,11 @@ run_dataset() {
     subject_session_paths_csv="$tmp_dir/subject_session_paths.csv"
     dataset_summary_json="$tmp_dir/dataset_summary.json"
     
-    # New Python-based exploration step
+    # Python-based exploration step
     python "$(dirname "$0")/dataset_utils.py" "$input_dir" > "$dataset_summary_json"
     cat "$dataset_summary_json" >&2
     # Build the session list from the exploration output
+    
     jq -r '
       .session_summary
       | keys[]
@@ -421,6 +492,32 @@ run_dataset() {
 
     echo "Discovered subject/session paths:" >&2
     cat "$subject_session_paths_csv" >&2
+
+    # here you add extraction of template flow 
+    # check config file. if template flow dir is specified, use that. else fetch from net.
+
+    #read template flow entry in config
+    # find all the different values for entry space in the dataset summary json.
+    spaces=$(jq -r '.session_summary | .[] | .func.space // empty' "$dataset_summary_json" | sort -u)
+    resolution=$(jq -r '.session_summary | .[] | .func.res // empty' "$dataset_summary_json" | sort -u)
+
+    # extract array of values from values in brakcets and remove []
+    spaces=$(printf '%s' "$spaces" | clean_json_value)
+    resolutions=$(printf '%s' "$resolution" | clean_json_value)
+
+    echo "Discovered spaces: $spaces" >&2
+    echo "Discovered resolutions: $resolutions" >&2
+
+    declare -A template_paths=()
+    declare -A entropy_values=()
+
+    for space in $spaces; do
+        for res in $resolutions; do
+            entropy_mni=$(get_entropy_mni "$space" "$res" template_paths)
+            entropy_values["${space}_${res}"]=$entropy_mni
+            echo "Entropy for ${space} res-${res}: $entropy_mni" >&2
+        done
+    done
 
     initialize_outputs
     export_parallel_context

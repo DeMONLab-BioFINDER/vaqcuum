@@ -19,7 +19,7 @@ extract_dice_metric() {
     local dice_val
     local metric_file
 
-    metric_file="$dice_dir/${sub_id}_${ses_id}.csv"
+    metric_file="$dice_dir/${sub_id}_${ses_id}_dice.csv"
 
     echo "Computing Dice for $sub_id $ses_id" >&2
 
@@ -72,7 +72,7 @@ extract_dropout_metric() {
     local dropout_size
     local dropout_compo
 
-    metric_file="$dropout_dir/${sub_id}_${ses_id}.csv"
+    metric_file="$dropout_dir/${sub_id}_${ses_id}_dropout.csv"
 
     mask_gm_thr="$id_tmp_dir/${sub_id}_${ses_id}_gm_thr.nii.gz"
     mask_merged="$id_tmp_dir/${sub_id}_${ses_id}_merged_mask.nii.gz"
@@ -193,31 +193,13 @@ PY
 transform_bold_t1space() {
     local sub_id="$1"
     local ses_id="$2"
-    local anat_directory="$3"
-    local func_directory="$4"
+    local t1="$3"
+    local matrix="$4"
     local refbold_file="$5"
 
     local bold_t1space
-    local t1
-    local matrix
 
     bold_t1space="${id_tmp_dir}/${sub_id}_${ses_id}_space-T1w_desc-coreg_boldref.nii.gz"
-
-    t1=$(find_single_file \
-        "$anat_directory" \
-        "${sub_id}_${ses_id}_*desc-preproc_T1w.nii.gz" \
-        "$mni_type_res")
-
-    matrix=$(find_single_file \
-        "$func_directory" \
-        "${sub_id}_${ses_id}*from-boldref_to-T1w_mode-image_desc-coreg_xfm.txt" \
-        "$mni_type_res")
-
-    echo "Transforming BOLD reference to T1w space for $sub_id $ses_id" >&2
-    echo "  refbold: $refbold_file" >&2
-    echo "  t1:      $t1" >&2
-    echo "  matrix:  $matrix" >&2
-    echo "  output:  $bold_t1space" >&2
 
     antsApplyTransforms \
         -d 3 \
@@ -227,38 +209,23 @@ transform_bold_t1space() {
         -t "$matrix" \
         --interpolation LanczosWindowedSinc \
         >&2
-
+    echo "computed bold_t1space for $sub_id $ses_id: $bold_t1space" >&2
     echo "$bold_t1space"
 }
 
 extract_nmi_metric() {
     local sub_id="$1"
     local ses_id="$2"
-    local anat_directory="$3"
-    local refbold_t1space="$4"
-    local refbold_mni_file="$5"
-    local entropy_mni="$6"
+    local t1="$3"
+    local t1_mask="$4"
+    local refbold_t1space="$5"
+    local wt1="$6"
+    local entropy_mni="$7"
 
-    local t1
-    local t1_mask
-    local wt1
     local metric_file
 
-    metric_file="$nmi_dir/${sub_id}_${ses_id}.csv"
-
-    t1=$(find_single_file \
-        "$anat_directory" \
-        "${sub_id}_${ses_id}_*desc-preproc_T1w.nii.gz" \
-        "$mni_type_res")
-
-    t1_mask=$(find_single_file \
-        "$anat_directory" \
-        "${sub_id}_${ses_id}_*desc-brain_mask.nii.gz" \
-        "$mni_type_res")
-
-    wt1=$(find_single_file \
-        "$anat_directory" \
-        "${sub_id}_${ses_id}_*space-${mni_type_res}*_desc-preproc_T1w.nii.gz")
+    metric_file="$nmi_dir/${sub_id}_${ses_id}_nmi.csv"
+      
 
     local t1_mask_bold_space
     local t1_resampled
@@ -268,6 +235,7 @@ extract_nmi_metric() {
 
     echo "Computing Mattes / entropy metrics for $sub_id $ses_id" >&2
 
+    echo "files used: $t1_mask, $t1, $refbold_t1space, $wt1, $entropy_mni" >&2
     antsApplyTransforms \
         -d 3 \
         -i "$t1_mask" \
@@ -296,11 +264,6 @@ extract_nmi_metric() {
         -d 3 \
         -m Mattes["$wt1","$mni",1,"$mattes_bins"] \
         -x "$mni_mask")
-
-    # mattes_wbold_mni=$(MeasureImageSimilarity \
-    #     -d 3 \
-    #     -m Mattes["$refbold_mni_file","$mni",1,"$mattes_bins"] \
-    #     -x "$mni_mask")
 
     local entropy_t1
     local entropy_bold

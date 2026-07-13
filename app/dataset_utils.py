@@ -4,7 +4,7 @@ This module provides functions to:
 - Discover folder hierarchies
 - Classify BIDS dataset structure as flat, nested, or mixed
 - Extract and map dataset structure
-- Find available BIDS entity strings (space-*, task-*, acq-*)
+- Find available BIDS entity strings (space-*, task-*, acq-*, res-*)
 - Validate dataset against expected patterns
 - Visualize directory trees
 """
@@ -24,6 +24,7 @@ ENTITY_PATTERNS = {
     "space": re.compile(r"(?:^|_)space-([A-Za-z0-9]+)(?:_|\.)"),
     "task": re.compile(r"(?:^|_)task-([A-Za-z0-9]+)(?:_|\.)"),
     "acq": re.compile(r"(?:^|_)acq-([A-Za-z0-9]+)(?:_|\.)"),
+    "res": re.compile(r"(?:^|_)res-([A-Za-z0-9]+)(?:_|\.)"),
 }
 
 
@@ -71,12 +72,12 @@ def _classify_subject_root(entry_name: str) -> Optional[str]:
 
 
 def _extract_entities_from_filename(filename: str) -> Dict[str, Optional[str]]:
-    """Extract space/task/acq entity values from a BIDS filename.
+    """Extract space/task/acq/res entity values from a BIDS filename.
 
     Returns None for missing entities.
     space values starting with fs are ignored.
     """
-    out = {"space": None, "task": None, "acq": None}
+    out = {"space": None, "task": None, "acq": None, "res": None}
     for key, pattern in ENTITY_PATTERNS.items():
         m = pattern.search(filename)
         if not m:
@@ -132,7 +133,7 @@ def discover_folder_structure(base_path: str, max_depth: int = 4) -> Dict[str, A
     - sessions: per-subject session sets
     - data_types: counts of anat/func dirs
     - file_types: counts of file extensions
-    - entity_strings: available space/task/acq strings in anat and func
+    - entity_strings: available space/task/acq/res strings in anat and func
     - session_summary: per-session summary of entities and counts
     """
     structure: Dict[str, Any] = {
@@ -143,8 +144,8 @@ def discover_folder_structure(base_path: str, max_depth: int = 4) -> Dict[str, A
         "data_types": defaultdict(int),
         "file_types": defaultdict(int),
         "entity_strings": {
-            "anat": {"space": None, "task": None, "acq": None},
-            "func": {"space": None, "task": None, "acq": None},
+            "anat": {"space": None, "task": None, "acq": None, "res": None},
+            "func": {"space": None, "task": None, "acq": None, "res": None},
         },
         "session_summary": {},
         "depth_map": {},
@@ -242,7 +243,7 @@ def discover_folder_structure(base_path: str, max_depth: int = 4) -> Dict[str, A
     }
 
     for dtype in ("anat", "func"):
-        for key in ("space", "task", "acq"):
+        for key in ("space", "task", "acq", "res"):
             values = structure["entity_strings"][dtype].get(key)
             if values:
                 structure["entity_strings"][dtype][key] = sorted(values)
@@ -253,14 +254,14 @@ def discover_folder_structure(base_path: str, max_depth: int = 4) -> Dict[str, A
 
 
 def find_bids_entities(base_path: str, max_depth: int = 6) -> Dict[str, Dict[str, Optional[List[str]]]]:
-    """Find all available space/task/acq strings in anat and func directories.
+    """Find all available space/task/acq/res strings in anat and func directories.
 
     - space excludes fs* labels
     - returns None when no values are found for a given entity/type
     """
     found = {
-        "anat": {"space": set(), "task": set(), "acq": set()},
-        "func": {"space": set(), "task": set(), "acq": set()},
+        "anat": {"space": set(), "task": set(), "acq": set(), "res": set()},
+        "func": {"space": set(), "task": set(), "acq": set(), "res": set()},
     }
 
     for root, dirs, files in os.walk(base_path):
@@ -298,7 +299,7 @@ def find_bids_entities(base_path: str, max_depth: int = 6) -> Dict[str, Dict[str
 
     result: Dict[str, Dict[str, Optional[List[str]]]] = {"anat": {}, "func": {}}
     for dtype in ("anat", "func"):
-        for key in ("space", "task", "acq"):
+        for key in ("space", "task", "acq", "res"):
             values = sorted(found[dtype][key])
             result[dtype][key] = values if values else None
     return result
@@ -314,12 +315,10 @@ def extract_dataset_structure(base_path: str) -> Dict[str, Any]:
         "valid_subjects": [],
         "flat_subjects": [],
         "mixed": False,
-        #"directory_hierarchy": defaultdict(lambda: defaultdict(list)),
         "missing_data_types": {},
-        #"file_inventory": defaultdict(list),
         "entities": {
-            "anat": {"space": None, "task": None, "acq": None},
-            "func": {"space": None, "task": None, "acq": None},
+            "anat": {"space": None, "task": None, "acq": None, "res": None},
+            "func": {"space": None, "task": None, "acq": None, "res": None},
         },
         "session_summary": {},
     }
@@ -327,7 +326,6 @@ def extract_dataset_structure(base_path: str) -> Dict[str, Any]:
     if not os.path.exists(base_path):
         return structure
 
-    # Top-level scan only keeps sub-* folders.
     subject_roots = _find_subject_roots(base_path)
 
     for subject_path in subject_roots:
@@ -356,30 +354,23 @@ def extract_dataset_structure(base_path: str) -> Dict[str, Any]:
     session_summary: Dict[str, Any] = {}
 
     for subject_root in subject_roots:
-
         subject_name = os.path.basename(subject_root)
 
         if _classify_subject_root(subject_name) == "nested":
-            # sub-001/ses-01/...
             session_dirs = [
                 os.path.join(subject_root, d)
                 for d in _safe_listdir(subject_root)
-                if d.startswith("ses-")
-                and _is_dir(os.path.join(subject_root, d))
+                if d.startswith("ses-") and _is_dir(os.path.join(subject_root, d))
             ]
-
         else:
-            # flat: sub-001_ses-01_fmriprep...
             session_dirs = [subject_root]
 
         for session_dir in session_dirs:
-
             if _classify_subject_root(subject_name) == "nested":
                 sub_id = subject_name
                 ses_id = os.path.basename(session_dir)
                 anat_dir = os.path.join(session_dir, "anat")
                 func_dir = os.path.join(session_dir, "func")
-
             else:
                 m = re.match(r"(sub-[^_]+)_(ses-[^_]+)", subject_name)
                 if m is None:
@@ -390,14 +381,15 @@ def extract_dataset_structure(base_path: str) -> Dict[str, Any]:
 
                 anat_dir = None
                 func_dir = None
-
                 for root, dirs, _ in os.walk(session_dir):
+                    if _is_ignored_path(list(Path(root).parts)):
+                        dirs[:] = []
+                        continue
                     if os.path.basename(root) == "anat":
                         anat_dir = root
                     elif os.path.basename(root) == "func":
                         func_dir = root
 
-        
             session_key = f"{sub_id}_{ses_id}"
 
             session_summary.setdefault(
@@ -410,6 +402,7 @@ def extract_dataset_structure(base_path: str) -> Dict[str, Any]:
                         "space": None,
                         "task": None,
                         "acq": None,
+                        "res": None,
                         "files_total": 0,
                     },
                     "func": {
@@ -417,6 +410,7 @@ def extract_dataset_structure(base_path: str) -> Dict[str, Any]:
                         "space": None,
                         "task": None,
                         "acq": None,
+                        "res": None,
                         "files_total": 0,
                     },
                 },
@@ -426,7 +420,6 @@ def extract_dataset_structure(base_path: str) -> Dict[str, Any]:
             session_summary[session_key]["func"]["path"] = func_dir
 
             for datatype, datatype_path in (("anat", anat_dir), ("func", func_dir)):
-
                 if datatype_path is None or not _is_dir(datatype_path):
                     continue
 
@@ -434,42 +427,31 @@ def extract_dataset_structure(base_path: str) -> Dict[str, Any]:
                     "space": set(),
                     "task": set(),
                     "acq": set(),
+                    "res": set(),
                 }
 
                 files_total = 0
 
                 for f in _safe_listdir(datatype_path):
-
-                    if (
-                        not _is_file(os.path.join(datatype_path, f))
-                        or f.endswith("_xfm.txt")
-                    ):
+                    if not _is_file(os.path.join(datatype_path, f)):
+                        continue
+                    if f.endswith("_xfm.txt"):
                         continue
 
                     files_total += 1
-
                     entities = _extract_entities_from_filename(f)
 
                     for entity_name, entity_value in entities.items():
                         if entity_value is None:
                             continue
-
                         if entity_name == "space" and entity_value.startswith("fs"):
                             continue
-
                         entity_sets[entity_name].add(entity_value)
 
-                session_summary[session_key][datatype]["space"] = (
-                    sorted(entity_sets["space"]) if entity_sets["space"] else None
-                )
-
-                session_summary[session_key][datatype]["task"] = (
-                    sorted(entity_sets["task"]) if entity_sets["task"] else None
-                )
-
-                session_summary[session_key][datatype]["acq"] = (
-                    sorted(entity_sets["acq"]) if entity_sets["acq"] else None
-                )
+                for key in ("space", "task", "acq", "res"):
+                    values = sorted(entity_sets[key]) if entity_sets[key] else None
+                    structure["entities"][datatype][key] = values
+                    session_summary[session_key][datatype][key] = values
 
                 session_summary[session_key][datatype]["files_total"] = files_total
 
