@@ -7,9 +7,10 @@
 extract_dice_metric() {
     local sub_id="$1"
     local ses_id="$2"
-    local anat_mask_mni="$3"
-    local func_mask_mni="$4"
-
+    local anat_mask="$3"
+    local func_mask="$4"
+    local space=$5
+    
     local intersection
     intersection="$id_tmp_dir/${sub_id}_${ses_id}_mask_intersection.nii.gz"
 
@@ -23,10 +24,10 @@ extract_dice_metric() {
 
     echo "Computing Dice for $sub_id $ses_id" >&2
 
-    anat_voxels=$(fslstats "$anat_mask_mni" -V | awk '{print $1}')
-    func_voxels=$(fslstats "$func_mask_mni" -V | awk '{print $1}')
+    anat_voxels=$(fslstats "$anat_mask" -V | awk '{print $1}')
+    func_voxels=$(fslstats "$func_mask" -V | awk '{print $1}')
 
-    fslmaths "$anat_mask_mni" -mul "$func_mask_mni" "$intersection"
+    fslmaths "$anat_mask" -mul "$func_mask" "$intersection"
 
     intersection_voxels=$(fslstats "$intersection" -V | awk '{print $1}')
 
@@ -221,6 +222,7 @@ extract_nmi_metric() {
     local refbold_t1space="$5"
     local wt1="$6"
     local entropy_mni="$7"
+    local mni_mask="$8"
 
     local metric_file
 
@@ -240,7 +242,7 @@ extract_nmi_metric() {
         -d 3 \
         -i "$t1_mask" \
         -r "$refbold_t1space" \
-        -o "$t1_mask_bold_space" \
+        -o "$t1mask_boldresampled" \
         -n NearestNeighbor \
         >&2
 
@@ -258,7 +260,7 @@ extract_nmi_metric() {
     mattes_t1_bold=$(MeasureImageSimilarity \
         -d 3 \
         -m Mattes["$t1_resampled","$refbold_t1space",1,"$mattes_bins"] \
-        -x "$t1_mask")
+        -x "$t1mask_boldresampled")
 
     mattes_wt1_mni=$(MeasureImageSimilarity \
         -d 3 \
@@ -268,16 +270,15 @@ extract_nmi_metric() {
     local entropy_t1
     local entropy_bold
     local entropy_wt1
-    local entropy_mni
 
-    entropy_t1=$(ImageIntensityStatistics 3 "$t1_resampled" "$t1_mask_bold_space" | awk 'NR==2 {print $6}')
-    entropy_bold=$(ImageIntensityStatistics 3 "$refbold_t1space" "$t1_mask_bold_space" | awk 'NR==2 {print $6}')
+    entropy_t1=$(ImageIntensityStatistics 3 "$t1_resampled" "$t1mask_boldresampled" | awk 'NR==2 {print $6}')
+    entropy_bold=$(ImageIntensityStatistics 3 "$refbold_t1space" "$t1mask_boldresampled" | awk 'NR==2 {print $6}')
     entropy_wt1=$(ImageIntensityStatistics 3 "$wt1" "$mni_mask" | awk 'NR==2 {print $6}')
-    entropy_mni=$(ImageIntensityStatistics 3 "$mni" "$mni_mask" | awk 'NR==2 {print $6}')
-
+    
     echo "$sub_id $ses_id | Mattes T1/BOLD: $mattes_t1_bold | wT1/MNI: $mattes_wt1_mni" >&2
-    echo "$sub_id $ses_id | Entropy T1: $entropy_t1 | BOLD: $entropy_bold | wT1: $entropy_wt1 | MNI: $entropy_mni" >&2
-    rm -f "$t1_mask_bold_space" "$t1_resampled"
+    echo "$sub_id $ses_id | Entropy T1: $entropy_t1 | BOLD: $entropy_bold | wT1: $entropy_wt1" >&2
+
+    rm -f "$t1mask_boldresampled" "$t1_resampled"
 
     {
         echo "sub_id,ses_id,mattes_t1_bold,mattes_wt1_mni,entropy_t1,entropy_bold,entropy_wt1,entropy_mni"

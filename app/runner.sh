@@ -1,29 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 ## note to future self:
 
 # add task and acq to final csv
 # metrics should be extracted for all the spaces available in the dir
 # add space col in csv
-# should have an initial funciotn that does some 'exploration' and extracts data structure and info like space, acq, task, etc. and then use that to extract metrics
-# delete wbold-mni 
-# NMI between t1 and refbold is masked by the t1 based anat mask. no intersection and such
-# NMI in template space is masked by the template mask. no intersection and such
+# DONE. should have an initial funciotn that does some 'exploration' and extracts data structure and info like space, acq, task, etc. and then use that to extract metrics
+# DONE. delete wbold-mni 
+# DONE. NMI between t1 and refbold is masked by the t1 based anat mask. no intersection and such
+# DONE. NMI in template space is masked by the template mask. no intersection and such
 # Dice in users space
 # dropout in users space
 # no bids filter
 # config file to minimum
 # fetch templateflow if not present
 # please provide path to template flow directory if no internet access. else leave empty and itll be fetched automatically from the net
-# 13.07 log out and err for each ID?
-
-#!/usr/bin/env bash
-set -euo pipefail
+# 13/07: log out and err for each ID?
 
 # ============================================================
 # SOURCING FUNCTIONS
 # ============================================================
 
 source $(dirname "$0")/utils.sh
-source $(dirname "$0")/bids_filter.sh
+#source $(dirname "$0")/bids_filter.sh
 source $(dirname "$0")/metrics.sh
 
 
@@ -50,23 +50,13 @@ fi
 
 read_config() {
     tmp_dir=$(read_yaml '.paths.tmp_dir')
-    # mni=$(read_yaml '.paths.mni')
-    # mni_mask=$(read_yaml '.paths.mni_mask')
-    # mni_type_res=$(read_yaml '.paths.mni_type_res')
-
     output_dir=$(read_yaml '.paths.output_dir')
     extracted_metrics_file=$(read_yaml '.paths.extracted_metrics_file')
-
     input_dir=$(read_yaml '.paths.input_dir')
-
     templateflow_dir=$(read_yaml '.paths.templateflow_dir')
 
-    # derivative_dir_template=$(read_yaml '.inputs.derivative_structure')
-    # anat_earliest_ses=$(read_yaml '.inputs.anat_earliest_ses // "no"')
 
     tmp_dir=$(expand_config_vars "$tmp_dir")
-    # mni=$(expand_config_vars "$mni")
-    # mni_mask=$(expand_config_vars "$mni_mask")
     output_dir=$(expand_config_vars "$output_dir")
     input_dir=$(expand_config_vars "$input_dir")
     extracted_metrics_file=$(expand_config_vars "$extracted_metrics_file")
@@ -78,7 +68,6 @@ read_config() {
 
     mkdir -p "$tmp_dir"
     mkdir -p "$output_dir"
-    #mkdir -p "$tmp_dir/rows"
 }
 
 read_bids_filter_values() {
@@ -238,7 +227,7 @@ resolve_subject_session_inputs() {
         "${session_key}*${anat_acq_string}_*desc-preproc_T1w.nii.gz" \
         "$anat_space")
 
-    mask_anat=$(find_single_file \
+    mask_anat_native=$(find_single_file \
         "$anat_dir" \
         "${session_key}*${anat_acq_string}*desc-brain_mask.nii.gz" \
         "$anat_space")
@@ -260,9 +249,19 @@ resolve_subject_session_inputs() {
         "$anat_dir" \
         "${session_key}*${anat_acq_string}*${anat_space_string}*label-GM_probseg.nii.gz")
 
+    gm_seg_native=$(find_single_file \
+        "$anat_dir" \
+        "${session_key}*${anat_acq_string}*label-GM_probseg.nii.gz" \
+        "$anat_space")
+
     mask_func_mni=$(find_single_file \
         "$func_dir" \
         "${func_prefix}*${task_prefix}*${func_acq_string}*${func_space_string}*desc-brain_mask.nii.gz")
+
+    mask_func_native=$(find_single_file \
+        "$func_dir" \
+        "${func_prefix}*${task_prefix}*${func_acq_string}*desc-brain_mask.nii.gz" \
+        "$func_space")
 
     refbold=$(find_single_file \
         "$func_dir" \
@@ -280,14 +279,16 @@ resolve_subject_session_inputs() {
     echo "  func_dir:       $func_dir" >&2
     echo "  anat_prefix:    $anat_prefix" >&2
     echo "  func_prefix:    $func_prefix" >&2
-    echo " "
+    echo " " >&2
     echo "  anat_t1:        $anat_t1" >&2
-    echo "  mask_anat:      $mask_anat" >&2
+    echo "  mask_anat:      $mask_anat_native" >&2
     echo "  anat_mni:       $anat_mni" >&2
     echo "  mask_anat_mni:  $mask_anat_mni" >&2
     echo "  gm_seg_mni:     $gm_seg_mni" >&2
+    echo "  gm_seg_native:  $gm_seg_native" >&2
     echo "  matrix:         $matrix" >&2
     echo "  mask_func_mni:  $mask_func_mni" >&2
+    echo "  mask_func:      $mask_func_native" >&2
     echo "  refbold:        $refbold" >&2
     echo "  refbold_mni:    $refbold_mni" >&2
     echo "#============================================================" >&2
@@ -336,19 +337,33 @@ process_subject_session() {
             "$gm_seg_mni"
     fi
 
+# if space contains MNI, then mask_anat_space=mask_anat_mni, mask_func_space=mask_func_mni
+    echo "anat_space: $anat_space" >&2
+    if [[ "$anat_space" == *"MNI"* ]]; then
+        mask_anat_space="$mask_anat_mni"
+        mask_func_space="$mask_func_mni"
+        gm_seg_space="$gm_seg_mni"
+        refbold_space="$refbold_mni"
+    else
+        mask_anat_space="$mask_anat_native"
+        mask_func_space="$mask_func_native"
+        gm_seg_space="$gm_seg_native"
+        refbold_space="$refbold_native"
+    fi
+
     extract_dice_metric \
         "$sub_id" \
         "$ses_id" \
-        "$mask_anat_mni" \
-        "$mask_func_mni"
+        "$mask_anat_space" \
+        "$mask_func_space"
 
     extract_dropout_metric \
         "$sub_id" \
         "$ses_id" \
-        "$gm_seg_mni" \
-        "$mask_anat_mni" \
-        "$mask_func_mni" \
-        "$refbold_mni"
+        "$gm_seg_space" \
+        "$mask_anat_space" \
+        "$mask_func_space" \
+        "$refbold_space"
 
     local refbold_t1space
 
@@ -363,10 +378,11 @@ process_subject_session() {
         "$sub_id" \
         "$ses_id" \
         "$anat_t1" \
-        "$mask_anat" \
+        "$mask_anat_native" \
         "$refbold_t1space" \
         "$anat_mni" \
-        "$entropy_mni" ##!!!!
+        "$entropy_mni" \
+        "$mask_anat_mni"
 
     echo "Finished $sub_id $ses_id" >&2
 }
@@ -436,13 +452,14 @@ export_parallel_context() {
     export nmi_dir
     export work_dir
     export entropy_values
+    export entropy_mni
 
     export t1w_pattern
     export bold_pattern
     export bids_filter_json
     export dataset_summary_json
 
-    export -f bids_filter_pattern
+    export anat_space
 
     export -f require_command
     export -f require_file
@@ -539,12 +556,6 @@ run_dataset() {
 main() {
     check_dependencies
     read_config
-
-    # bids_filter_json="$tmp_dir/bids_filter.json"
-    # create_bids_filter_json "$config_file" "$bids_filter_json" >&2
-
-    # t1w_pattern=$(bids_filter_pattern "t1w")
-    # bold_pattern=$(bids_filter_pattern "bold")
 
     check_inputs_global
     run_dataset
