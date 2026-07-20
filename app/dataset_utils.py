@@ -306,11 +306,13 @@ def find_bids_entities(base_path: str, max_depth: int = 6) -> Dict[str, Dict[str
 
 
 def extract_dataset_structure(base_path: str) -> Dict[str, Any]:
-    """Extract comprehensive dataset structure information with hierarchical breakdown.
+    """Extract comprehensive dataset structure information.
 
-    Summary is organized per session. Nuisance folders are ignored.
+    Summary is organized per session for longitudinal datasets and per subject
+    for cross-sectional datasets. Nuisance folders are ignored.
     """
     structure: Dict[str, Any] = {
+        "dataset_type": "unknown",
         "structure_type": "unknown",
         "valid_subjects": [],
         "flat_subjects": [],
@@ -340,7 +342,10 @@ def extract_dataset_structure(base_path: str) -> Dict[str, Any]:
     structure["valid_subjects"] = sorted(set(structure["valid_subjects"]))
     structure["flat_subjects"] = sorted(set(structure["flat_subjects"]))
 
-    structure["mixed"] = bool(structure["valid_subjects"] and structure["flat_subjects"])
+    structure["mixed"] = bool(
+        structure["valid_subjects"] and structure["flat_subjects"]
+    )
+
     structure["structure_type"] = (
         "mixed"
         if structure["mixed"]
@@ -352,45 +357,87 @@ def extract_dataset_structure(base_path: str) -> Dict[str, Any]:
     )
 
     session_summary: Dict[str, Any] = {}
+    found_session_entity = False
 
     for subject_root in subject_roots:
         subject_name = os.path.basename(subject_root)
+        subject_kind = _classify_subject_root(subject_name)
 
-        if _classify_subject_root(subject_name) == "nested":
-            session_dirs = [
-                os.path.join(subject_root, d)
-                for d in _safe_listdir(subject_root)
-                if d.startswith("ses-") and _is_dir(os.path.join(subject_root, d))
+        if subject_kind == "nested":
+            named_session_dirs = [
+                os.path.join(subject_root, directory_name)
+                for directory_name in _safe_listdir(subject_root)
+                if (
+                    directory_name.startswith("ses-")
+                    and _is_dir(os.path.join(subject_root, directory_name))
+                )
             ]
+
+            if named_session_dirs:
+                session_dirs = named_session_dirs
+                found_session_entity = True
+            else:
+                # Cross-sectional dataset: anat/func are directly under sub-*.
+                session_dirs = [subject_root]
+
         else:
+            # Session is optional for flat datasets.
+            match = re.match(
+                r"(sub-[^_]+)(?:_(ses-[^_]+))?",
+                subject_name,
+            )
+
+            if match is None:
+                continue
+
             session_dirs = [subject_root]
 
         for session_dir in session_dirs:
-            if _classify_subject_root(subject_name) == "nested":
+            if subject_kind == "nested":
                 sub_id = subject_name
-                ses_id = os.path.basename(session_dir)
+                session_name = os.path.basename(session_dir)
+
+                if session_name.startswith("ses-"):
+                    ses_id = session_name
+                    found_session_entity = True
+                else:
+                    ses_id = ""
+
                 anat_dir = os.path.join(session_dir, "anat")
                 func_dir = os.path.join(session_dir, "func")
+
             else:
-                m = re.match(r"(sub-[^_]+)_(ses-[^_]+)", subject_name)
-                if m is None:
+                match = re.match(
+                    r"(sub-[^_]+)(?:_(ses-[^_]+))?",
+                    subject_name,
+                )
+
+                if match is None:
                     continue
 
-                sub_id = m.group(1)
-                ses_id = m.group(2)
+                sub_id = match.group(1)
+                ses_id = match.group(2) or ""
+
+                if ses_id:
+                    found_session_entity = True
 
                 anat_dir = None
                 func_dir = None
+
                 for root, dirs, _ in os.walk(session_dir):
                     if _is_ignored_path(list(Path(root).parts)):
                         dirs[:] = []
                         continue
-                    if os.path.basename(root) == "anat":
+
+                    root_name = os.path.basename(root)
+
+                    if root_name == "anat":
                         anat_dir = root
-                    elif os.path.basename(root) == "func":
+                    elif root_name == "func":
                         func_dir = root
 
-            session_key = f"{sub_id}_{ses_id}"
+            # Avoid a trailing underscore for cross-sectional datasets.
+            session_key = f"{sub_id}_{ses_id}" if ses_id else sub_id
 
             session_summary.setdefault(
                 session_key,
@@ -419,7 +466,10 @@ def extract_dataset_structure(base_path: str) -> Dict[str, Any]:
             session_summary[session_key]["anat"]["path"] = anat_dir
             session_summary[session_key]["func"]["path"] = func_dir
 
-            for datatype, datatype_path in (("anat", anat_dir), ("func", func_dir)):
+            for datatype, datatype_path in (
+                ("anat", anat_dir),
+                ("func", func_dir),
+            ):
                 if datatype_path is None or not _is_dir(datatype_path):
                     continue
 
@@ -432,28 +482,50 @@ def extract_dataset_structure(base_path: str) -> Dict[str, Any]:
 
                 files_total = 0
 
-                for f in _safe_listdir(datatype_path):
-                    if not _is_file(os.path.join(datatype_path, f)):
+                for filename in _safe_listdir(datatype_path):
+                    file_path = os.path.join(datatype_path, filename)
+
+                    if not _is_file(file_path):
                         continue
-                    if f.endswith("_xfm.txt"):
+
+                    if filename.endswith("_xfm.txt"):
                         continue
 
                     files_total += 1
-                    entities = _extract_entities_from_filename(f)
+                    entities = _extract_entities_from_filename(filename)
 
                     for entity_name, entity_value in entities.items():
                         if entity_value is None:
                             continue
-                        if entity_name == "space" and entity_value.startswith("fs"):
+
+                        if (
+                            entity_name == "space"
+                            and entity_value.startswith("fs")
+                        ):
                             continue
+
                         entity_sets[entity_name].add(entity_value)
 
-                for key in ("space", "task", "acq", "res"):
-                    values = sorted(entity_sets[key]) if entity_sets[key] else None
-                    structure["entities"][datatype][key] = values
-                    session_summary[session_key][datatype][key] = values
+                for entity_name in ("space", "task", "acq", "res"):
+                    values = (
+                        sorted(entity_sets[entity_name])
+                        if entity_sets[entity_name]
+                        else None
+                    )
 
-                session_summary[session_key][datatype]["files_total"] = files_total
+                    structure["entities"][datatype][entity_name] = values
+                    session_summary[session_key][datatype][entity_name] = values
+
+                session_summary[session_key][datatype]["files_total"] = (
+                    files_total
+                )
+
+    if session_summary:
+        structure["dataset_type"] = (
+            "longitudinal"
+            if found_session_entity
+            else "cross_sectional"
+        )
 
     structure["session_summary"] = session_summary
     return structure

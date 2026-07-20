@@ -299,3 +299,31 @@ get_earliest_anat_dir() {
 
     echo "${anat_dirs[0]}"
 }
+
+resample_to_t1() {
+    local mask_func_space="$1"
+    local refbold_space="$2"
+    local reference_file="$3"
+
+    mask_func_anatres=${mask_func_space%.nii.gz}_anatres.nii.gz
+    refbold_anatres=${refbold_space%.nii.gz}_anatres.nii.gz
+    echo "$mask_func_space"
+    echo "$refbold_space"
+    echo "$reference_file"
+    echo "$mask_func_anatres"
+    echo "$refbold_anatres"
+
+    antsApplyTransforms \
+        -d 3 \
+        -i "$mask_func_space" \
+        -r "$reference_file" \
+        -o "$mask_func_anatres" \
+        -n NearestNeighbor
+
+    antsApplyTransforms \
+        -d 3 \
+        -i "$refbold_space" \
+        -r "$reference_file" \
+        -o "$refbold_anatres" \
+        -n BSpline
+}

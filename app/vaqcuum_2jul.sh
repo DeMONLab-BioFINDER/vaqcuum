@@ -1,6 +1,10 @@
 #### note to self:
-# need to add --output-space
-# and session type: multi or single session
+# need to test native t1 space. multiple spaces. TESTED, but:
+# make sure nmi is computed also for t1 space. its empty now, kinda fine bc we got mni space ones, which also does t1 space, but gotta fix that
+# account for run- string too
+# add bids filter
+# add keep or delete working files
+# investigate session type: multi or single session
 
 #!/usr/bin/env bash
 set -euo pipefail
