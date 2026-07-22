@@ -1,7 +1,7 @@
 # user action: Configure the paths and settings for the vaqcuum pipeline
 
 paths:
-  input_dir: "/Users/ga0034de/Desktop/jon_vallecas"
+  input_dir: "/Users/ga0034de/Desktop/lea_a4"
 
   output_dir: "/Users/ga0034de/Desktop/test_output"
   extracted_metrics_file: "{output_dir}/extracted_metrics.csv"

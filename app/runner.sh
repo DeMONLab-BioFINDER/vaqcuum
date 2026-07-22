@@ -150,6 +150,181 @@ is_mni_space() {
     [[ "${value^^}" == *MNI* ]]
 }
 
+zip_archive_layout() {
+    local archive="${1:-}"
+
+    if [[ -z "$archive" || ! -f "$archive" ]]; then
+        return 1
+    fi
+
+    unzip -Z1 "$archive" \
+        | awk '
+            function unsafe(path) {
+                return path ~ /^\// || path == ".." || path ~ /^\.\.\// || path ~ /\/\.\.\// || path ~ /\/\.\.$/
+            }
+
+            {
+                sub(/\r$/, "", $0)
+                while (sub(/^\.\//, "", $0)) {}
+
+                if ($0 == "") {
+                    next
+                }
+
+                if (unsafe($0)) {
+                    print "unsafe"
+                    fatal = 1
+                    exit
+                }
+
+                # Ignore common macOS ZIP metadata when deciding whether the
+                # archive already contains one meaningful top-level folder.
+                if ($0 == ".DS_Store" || $0 ~ /(^|\/)\.DS_Store$/ || $0 ~ /^__MACOSX\//) {
+                    next
+                }
+
+                meaningful += 1
+
+                slash = index($0, "/")
+                if (slash == 0) {
+                    has_top_level_file = 1
+                    root = $0
+                } else {
+                    root = substr($0, 1, slash - 1)
+                }
+
+                roots[root] = 1
+            }
+
+            END {
+                if (fatal) {
+                    exit
+                }
+
+                if (meaningful == 0) {
+                    print "empty"
+                    exit
+                }
+
+                root_count = 0
+                for (root in roots) {
+                    root_count += 1
+                    only_root = root
+                }
+
+                if (root_count == 1 && !has_top_level_file) {
+                    print "single_root\t" only_root
+                } else {
+                    print "multiple_or_flat"
+                }
+            }
+        '
+}
+
+extract_one_zip_archive() {
+    local archive="${1:-}"
+
+    if [[ -z "$archive" || ! -f "$archive" ]]; then
+        log_error "ZIP archive does not exist: ${archive:-<empty>}"
+        return 1
+    fi
+
+    local layout
+    if ! layout=$(zip_archive_layout "$archive"); then
+        log_error "Could not inspect ZIP archive: $archive"
+        return 1
+    fi
+
+    local archive_filename="${archive##*/}"
+    local archive_stem="${archive_filename%.*}"
+    local destination
+
+    case "$layout" in
+        single_root$'\t'*)
+            destination="$input_dir"
+            log_debug \
+                "zip=$archive layout=single-root destination=$destination"
+            ;;
+
+        multiple_or_flat)
+            destination="$input_dir/$archive_stem"
+            log_debug \
+                "zip=$archive layout=flat-or-multiple destination=$destination"
+            ;;
+
+        unsafe)
+            log_error "Unsafe parent or absolute path found in ZIP archive: $archive"
+            return 1
+            ;;
+
+        empty)
+            log_error "ZIP archive contains no usable entries: $archive"
+            return 1
+            ;;
+
+        *)
+            log_error "Could not determine ZIP layout for $archive: $layout"
+            return 1
+            ;;
+    esac
+
+    mkdir -p "$destination"
+
+    # -n makes extraction safe to rerun: existing files are not overwritten.
+    if ! unzip -q -n "$archive" -d "$destination"; then
+        log_error "Could not extract ZIP archive: $archive"
+        return 1
+    fi
+
+    log_ok "Extracted ${archive_filename} -> ${destination}"
+}
+
+extract_zipped_input_directories() {
+    local archive
+    local -a archives=()
+
+    while IFS= read -r -d '' archive; do
+        archives+=("$archive")
+    done < <(
+        find "$input_dir" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type f \
+            -iname '*.zip' \
+            -print0
+    )
+
+    if (( ${#archives[@]} == 0 )); then
+        log_debug "No top-level ZIP archives found in $input_dir"
+        return 0
+    fi
+
+    log_step \
+        "Inspecting and extracting ${#archives[@]} ZIP archive(s) with $n_jobs parallel job(s)"
+
+    # GNU Parallel starts a fresh shell for each archive. Export the helper and
+    # logging functions plus the values they need.
+    export SHELL=/bin/bash
+    export input_dir
+    export C_RESET C_RED C_GREEN C_YELLOW C_CYAN C_DIM
+    export LOG_TIMESTAMPS LOG_CONTEXT VERBOSE
+    export -f log_message log_info log_ok log_warn log_error log_debug
+    export -f zip_archive_layout extract_one_zip_archive
+
+    if ! parallel \
+        --jobs "$n_jobs" \
+        --halt soon,fail=1 \
+        --line-buffer \
+        extract_one_zip_archive '{}' \
+        ::: "${archives[@]}"
+    then
+        log_error "One or more input ZIP archives could not be extracted."
+        return 1
+    fi
+
+    log_ok "ZIP input extraction completed"
+}
+
 # Accept a JSON scalar or array and return one non-null value.
 # Use this only for fields that are genuinely singular for a work item. Fields
 # such as functional space, resolution, acquisition, and run are expanded into
@@ -803,6 +978,7 @@ check_dependencies() {
     require_command fslmaths
     require_command python
     require_command parallel
+    require_command unzip
 
     require_command antsApplyTransforms
     require_command MeasureImageSimilarity
@@ -2231,6 +2407,10 @@ run_dataset() {
     local subject_id_keys_file="$tmp_dir/subject_id_keys.txt"
     work_items_tsv="$tmp_dir/functional_work_items.tsv"
     dataset_summary_json="$tmp_dir/dataset_summary.json"
+
+    # The input layout cannot be discovered or validated until any archived
+    # top-level subject/session directories have been extracted.
+    extract_zipped_input_directories
 
     log_step "Exploring dataset structure"
     structure_command=(
