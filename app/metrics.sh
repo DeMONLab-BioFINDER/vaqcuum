@@ -336,11 +336,6 @@ extract_nmi_metric() {
         -m "Mattes[${t1_boldres},${refbold_t1space},1,${mattes_bins}]" \
         -x "$t1_mask_boldres")
 
-    mattes_wt1_mni=$(MeasureImageSimilarity \
-        -d 3 \
-        -m "Mattes[${wt1},${mni_template},1,${mattes_bins}]" \
-        -x "$mni_mask")
-
     log_info "NMI: calculating image entropy values"
     entropy_t1=$(
         ImageIntensityStatistics \
@@ -353,12 +348,22 @@ extract_nmi_metric() {
             3 "$refbold_t1space" "$t1_mask_boldres" |
             awk 'NR == 2 {print $6}'
     )
-
-    entropy_wt1=$(
-        ImageIntensityStatistics \
-            3 "$wt1" "$mni_mask" |
-            awk 'NR == 2 {print $6}'
-    )
+    # do this only if space contains mni
+    if [[ "$space" == *"MNI"* ]]; then
+        entropy_wt1=$(
+            ImageIntensityStatistics \
+                3 "$wt1" "$mni_mask" |
+                awk 'NR == 2 {print $6}'
+        )
+        mattes_wt1_mni=$(MeasureImageSimilarity \
+        -d 3 \
+        -m "Mattes[${wt1},${mni_template},1,${mattes_bins}]" \
+        -x "$mni_mask")
+    else
+        entropy_wt1="NA"
+        mattes_wt1_mni="NA"
+    fi
+    
 
     if [[ -z "$mattes_t1_bold" || -z "$mattes_wt1_mni" ]]; then
         log_error "Empty Mattes result"
@@ -438,9 +443,10 @@ def numeric_col(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.to_numeric(df[col], errors="coerce")
 
 
-def safe_nmi(entropy_a: pd.Series, entropy_b: pd.Series, joint_term: pd.Series) -> pd.Series:
-    out = (entropy_a + entropy_b) / joint_term
+def safe_nmi(entropy_a: pd.Series, entropy_b: pd.Series, mattes_term: pd.Series) -> pd.Series:
+    out = (round((2*mattes_term) / (entropy_a + entropy_b), 3))
     out = out.replace([np.inf, -np.inf], np.nan)
+    out = -1 * out
     return out
 
 
@@ -465,14 +471,13 @@ dropout["dropout_intensity"] = dropout["intensity_dropout"] / dropout["intensity
 dropout["dropout_size"] = dropout["volume_dropout"] / dropout["volume_gm"]
 dropout["dropout_compo"] = (1 - dropout["dropout_intensity"]) + dropout["dropout_size"]
 
-dropout = dropout.replace([np.inf, -np.inf], np.nan)
+dropout = round(dropout.replace([np.inf, -np.inf], np.nan), 3)
 
 # Keep only this dropout metric in the final merged CSV
 dropout = dropout[keys + ["dropout_compo"]].copy()
 
 nmi_raw = read_metric_dir(nmi_dir, "nmi")
 
-# Compute NMI from entropy terms and Mattes/joint term.
 nmi = nmi_raw[keys].copy()
 
 nmi["nmi_t1_bold"] = safe_nmi(
@@ -487,12 +492,6 @@ nmi["nmi_wt1_mni"] = safe_nmi(
     numeric_col(nmi_raw, "mattes_wt1_mni"),
 )
 
-# nmi["nmi_wbold_mni"] = safe_nmi(
-#     numeric_col(nmi_raw, "entropy_wbold"),
-#     numeric_col(nmi_raw, "entropy_mni"),
-#     numeric_col(nmi_raw, "mattes_wbold_mni"),
-# )
-
 merged = (
     dice
     .merge(dropout, on=keys, how="outer", validate="one_to_one")
@@ -500,6 +499,37 @@ merged = (
 )
 
 merged = merged.sort_values(keys).reset_index(drop=True)
+
+# Copy the MNI nmi_t1_bold value onto the corresponding T1w row.
+mni_space_mask = (
+    merged["space"]
+    .astype("string")
+    .str.contains("MNI", case=False, na=False)
+)
+
+t1w_space_masking = merged["space"].eq("T1w")
+
+matching_mni_nmi = (
+    merged["nmi_t1_bold"]
+    .where(mni_space_mask)
+    .groupby(
+        [
+            merged["id_key"],
+            merged["task"],
+            merged["acq"],
+        ],
+        dropna=False,
+    )
+    .transform("first")
+)
+
+rows_to_update = t1w_space_masking & matching_mni_nmi.notna()
+
+merged.loc[rows_to_update, "nmi_t1_bold"] = (
+    matching_mni_nmi.loc[rows_to_update]
+)
+
+merged.loc[t1w_space_masking, "nmi_wt1_mni"] = np.nan
 
 final_columns = [
     "id_key",

@@ -1,0 +1,9 @@
+{
+  "bold": {
+    "task": ["rest"],
+    "space": ["MNI152NLin2009cAsym"]
+  },
+  "t1w": {
+    "space": ["MNI152NLin2009cAsym"]
+  }
+}

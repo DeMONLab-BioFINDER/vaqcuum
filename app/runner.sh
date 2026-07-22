@@ -11,7 +11,7 @@ set -euo pipefail
 #   FORCE_COLOR=1    force colors even when stderr is not a TTY
 #   LOG_TIMESTAMPS=0 disable timestamps
 
-VERBOSE="${VERBOSE:-2}"
+VERBOSE="${VERBOSE:-1}"
 LOG_TIMESTAMPS="${LOG_TIMESTAMPS:-1}"
 LOG_CONTEXT="${LOG_CONTEXT:-}"
 
@@ -84,7 +84,35 @@ log_section() {
 # ============================================================
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+no_temp_cleanup=0
 config_file="${1:-}"
+shift || true
+
+bids_filter=""
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        --bids-filter|--bids_filter)
+            if [[ "$#" -lt 2 || "$2" == -* ]]; then
+                echo "ERROR: $1 requires a JSON file." >&2
+                exit 1
+            fi
+
+            bids_filter="$2"
+            shift 2
+            ;;
+
+        --no-temp-cleanup)
+            no_temp_cleanup=1
+            shift
+            ;;
+
+        *)
+            echo "ERROR: Unknown runner option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
 
 if [[ -z "$config_file" ]]; then
     log_error "Missing config file."
@@ -233,6 +261,71 @@ lookup_template_entropy() {
 }
 
 
+anat_dir_has_t1w() {
+    local anat_path="${1:-}"
+
+    [[ -n "$anat_path" && -d "$anat_path" ]] || return 1
+
+    find "$anat_path" \
+        -maxdepth 1 \
+        -type f \
+        -name '*_T1w.nii.gz' \
+        -print -quit \
+        | grep -q .
+}
+
+
+subject_session_count() {
+    local subject_id="${1:-}"
+
+    if [[ -z "$subject_id" ]]; then
+        printf '0\n'
+        return 0
+    fi
+
+    local subject_dir="$input_dir/$subject_id"
+    local count=0
+
+    # Standard layout: input_dir/sub-*/ses-*
+    if [[ -d "$subject_dir" ]]; then
+        count=$(
+            find "$subject_dir" \
+                -mindepth 1 \
+                -maxdepth 1 \
+                -type d \
+                -name 'ses-*' \
+                -print \
+                | sed 's#.*/##' \
+                | sort -u \
+                | awk 'NF {count++} END {print count + 0}'
+        )
+
+        if (( count > 0 )); then
+            printf '%s\n' "$count"
+            return 0
+        fi
+    fi
+
+    # Wrapped layout: one top-level wrapper per subject/session. Ignore any
+    # provenance suffix after the session label and count unique sessions.
+    count=$(
+        find "$input_dir" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -name "${subject_id}_ses-*" \
+            -print \
+            | sed 's#.*/##' \
+            | sed -nE \
+                "s/^${subject_id}_(ses-[A-Za-z0-9]+)(_.+)?$/\1/p" \
+            | sort -u \
+            | awk 'NF {count++} END {print count + 0}'
+    )
+
+    printf '%s\n' "$count"
+}
+
+
 find_wrapped_session_anat_dir() {
     local subject_id="${1:-}"
     local session_id="${2:-}"
@@ -243,25 +336,24 @@ find_wrapped_session_anat_dir() {
 
     # A wrapped directory may contain a provenance/version suffix, for example:
     #   sub-31728786_ses-0_fmriprep-25-2-5
-    # Match both the bare prefix and any underscore-delimited suffix.
     local wrapper_prefix="${subject_id}_${session_id}"
     local wrapper_dir=""
     local candidate=""
-    local first_match=""
-    local match_count=0
+    local session_count
+    local -a session_matches=()
+    local -a shared_matches=()
+
+    session_count=$(subject_session_count "$subject_id")
 
     while IFS= read -r -d '' wrapper_dir; do
-        while IFS= read -r candidate; do
-            [[ -z "$candidate" ]] && continue
-            ((match_count += 1))
-            if (( match_count == 1 )); then
-                first_match="$candidate"
-            fi
+        while IFS= read -r -d '' candidate; do
+            anat_dir_has_t1w "$candidate" || continue
+            session_matches+=("$candidate")
         done < <(
             find "$wrapper_dir" \
                 -type d \
                 -path "*/${subject_id}/${session_id}/anat" \
-                -print
+                -print0
         )
     done < <(
         find "$input_dir" \
@@ -272,19 +364,34 @@ find_wrapped_session_anat_dir() {
             -print0
     )
 
-    if (( match_count == 1 )); then
-        printf '%s\n' "$first_match"
+    if (( ${#session_matches[@]} == 1 )); then
+        printf '%s
+' "${session_matches[0]}"
         return 0
     fi
 
-    if (( match_count > 1 )); then
-        log_error "Multiple wrapped anat directories match ${subject_id}_${session_id}:"
+    if (( ${#session_matches[@]} > 1 )); then
+        log_error "Multiple wrapped session anat directories contain T1w files for ${subject_id}_${session_id}:"
+        printf '  - %s
+' "${session_matches[@]}" >&2
+        return 1
+    fi
+
+    # Shared anatomy outside ses-* is valid only for a genuinely
+    # multi-session subject in a longitudinal dataset.
+    if [[ "${anat_outside_ses_enabled:-0}" == "1" ]] \
+        && (( session_count > 1 ))
+    then
         while IFS= read -r -d '' wrapper_dir; do
-            find "$wrapper_dir" \
-                -type d \
-                -path "*/${subject_id}/${session_id}/anat" \
-                -print \
-                | sed 's/^/  - /' >&2
+            while IFS= read -r -d '' candidate; do
+                anat_dir_has_t1w "$candidate" || continue
+                shared_matches+=("$candidate")
+            done < <(
+                find "$wrapper_dir" \
+                    -type d \
+                    -path "*/${subject_id}/anat" \
+                    -print0
+            )
         done < <(
             find "$input_dir" \
                 -mindepth 1 \
@@ -293,6 +400,18 @@ find_wrapped_session_anat_dir() {
                 \( -name "$wrapper_prefix" -o -name "${wrapper_prefix}_*" \) \
                 -print0
         )
+    fi
+
+    if (( ${#shared_matches[@]} == 1 )); then
+        printf '%s
+' "${shared_matches[0]}"
+        return 0
+    fi
+
+    if (( ${#shared_matches[@]} > 1 )); then
+        log_error "Multiple wrapped subject-level anat directories contain T1w files for ${subject_id}_${session_id}:"
+        printf '  - %s
+' "${shared_matches[@]}" >&2
     fi
 
     return 1
@@ -307,14 +426,19 @@ find_session_anat_dir() {
     fi
 
     # Layout 1: input_dir/sub-*/ses-*/**/anat
-    local session_dir="$input_dir/$subject_id/$session_id"
+    local subject_dir="$input_dir/$subject_id"
+    local session_dir="$subject_dir/$session_id"
+    local session_count
+
+    session_count=$(subject_session_count "$subject_id")
 
     if [[ -d "$session_dir" ]]; then
-        local anat_dir
-        local -a anat_matches=()
+        local anat_path
+        local -a session_matches=()
 
-        while IFS= read -r -d '' anat_dir; do
-            anat_matches+=("$anat_dir")
+        while IFS= read -r -d '' anat_path; do
+            anat_dir_has_t1w "$anat_path" || continue
+            session_matches+=("$anat_path")
         done < <(
             find "$session_dir" \
                 -mindepth 1 \
@@ -323,13 +447,29 @@ find_session_anat_dir() {
                 -print0
         )
 
-        if (( ${#anat_matches[@]} == 1 )); then
-            printf '%s\n' "${anat_matches[0]}"
+        if (( ${#session_matches[@]} == 1 )); then
+            printf '%s
+' "${session_matches[0]}"
             return 0
-        elif (( ${#anat_matches[@]} > 1 )); then
+        elif (( ${#session_matches[@]} > 1 )); then
             log_error \
-                "Found multiple anat directories for ${subject_id}/${session_id}"
+                "Found multiple anat directories containing T1w files for ${subject_id}/${session_id}"
+            printf '  - %s
+' "${session_matches[@]}" >&2
             return 1
+        fi
+
+        # If this is longitudinal and the session has no T1w image, use the
+        # subject-level anat directory one level above the ses-* directories.
+        local shared_anat_dir="$subject_dir/anat"
+
+        if [[ "${anat_outside_ses_enabled:-0}" == "1" ]] \
+            && (( session_count > 1 )) \
+            && anat_dir_has_t1w "$shared_anat_dir"
+        then
+            printf '%s
+' "$shared_anat_dir"
+            return 0
         fi
     fi
 
@@ -351,22 +491,27 @@ validate_input_subject_directories() {
     while IFS= read -r -d '' child_dir; do
         child_name=${child_dir##*/}
 
-        # Layout 1: input_dir/sub-*/ses-*/**/anat
+        # Layout 1:
+        #   input_dir/sub-*/ses-*/**/anat
+        # or, for longitudinal datasets with shared anatomy:
+        #   input_dir/sub-*/anat
         if [[ "$child_name" =~ ^sub-[A-Za-z0-9]+$ ]]; then
-            local session_dir session_name anat_dir
+            local session_dir session_name anat_path
             local session_count=0
             local invalid_subject=0
-            local -a anat_matches=()
+            local -a session_t1w_matches=()
+            local -a sessions_without_t1w=()
 
             while IFS= read -r -d '' session_dir; do
                 session_name=${session_dir##*/}
                 [[ ! "$session_name" =~ ^ses-[A-Za-z0-9]+$ ]] && continue
 
                 ((session_count += 1))
-                anat_matches=()
+                session_t1w_matches=()
 
-                while IFS= read -r -d '' anat_dir; do
-                    anat_matches+=("$anat_dir")
+                while IFS= read -r -d '' anat_path; do
+                    anat_dir_has_t1w "$anat_path" || continue
+                    session_t1w_matches+=("$anat_path")
                 done < <(
                     find "$session_dir" \
                         -mindepth 1 \
@@ -375,18 +520,14 @@ validate_input_subject_directories() {
                         -print0
                 )
 
-                if (( ${#anat_matches[@]} == 1 )); then
+                if (( ${#session_t1w_matches[@]} == 1 )); then
                     log_debug \
-                        "standard_session=${child_name}/${session_name} anat=${anat_matches[0]}"
-                elif (( ${#anat_matches[@]} == 0 )); then
-                    invalid_entries+=(
-                        "$session_dir :: missing nested anat directory"
-                    )
-                    ((invalid_count += 1))
-                    invalid_subject=1
+                        "standard_session=${child_name}/${session_name} anat=${session_t1w_matches[0]}"
+                elif (( ${#session_t1w_matches[@]} == 0 )); then
+                    sessions_without_t1w+=("$session_name")
                 else
                     invalid_entries+=(
-                        "$session_dir :: found multiple nested anat directories"
+                        "$session_dir :: found multiple anat directories containing _T1w.nii.gz"
                     )
                     ((invalid_count += 1))
                     invalid_subject=1
@@ -401,10 +542,34 @@ validate_input_subject_directories() {
 
             if (( session_count == 0 )); then
                 invalid_entries+=(
-                    "$child_dir :: expected at least one ses-*/**/anat directory"
+                    "$child_dir :: expected at least one ses-* directory"
                 )
                 ((invalid_count += 1))
-            elif (( invalid_subject == 0 )); then
+                invalid_subject=1
+            elif (( ${#sessions_without_t1w[@]} > 0 )); then
+                local shared_anat_dir="$child_dir/anat"
+
+                if (( session_count == 1 )); then
+                    invalid_entries+=(
+                        "$child_dir :: its only session (${sessions_without_t1w[0]}) must contain _T1w.nii.gz inside that session"
+                    )
+                    ((invalid_count += 1))
+                    invalid_subject=1
+                elif [[ "${anat_outside_ses_enabled:-0}" == "1" ]] \
+                    && anat_dir_has_t1w "$shared_anat_dir"
+                then
+                    log_debug \
+                        "shared_anat=${shared_anat_dir} missing_sessions=${sessions_without_t1w[*]}"
+                else
+                    invalid_entries+=(
+                        "$child_dir :: multi-session subject has session(s) without _T1w.nii.gz (${sessions_without_t1w[*]}) but no usable subject-level anat/_T1w.nii.gz"
+                    )
+                    ((invalid_count += 1))
+                    invalid_subject=1
+                fi
+            fi
+
+            if (( invalid_subject == 0 )); then
                 ((standard_count += 1))
             fi
 
@@ -412,20 +577,23 @@ validate_input_subject_directories() {
         fi
 
         # Layout 2: input_dir/sub-*_ses-*[_suffix]/**/sub-*/ses-*/anat
-        # Examples:
-        #   sub-31728786_ses-0
-        #   sub-31728786_ses-0_fmriprep-25-2-5
+        # A wrapped longitudinal result may instead keep anatomy at
+        # **/sub-*/anat when its session folder has no T1w image.
         if [[ "$child_name" =~ ^(sub-[A-Za-z0-9]+)_(ses-[A-Za-z0-9]+)(_.+)?$ ]]; then
             local wrapped_subject wrapped_session wrapped_anat
+            local wrapped_subject_session_count
             wrapped_subject="${BASH_REMATCH[1]}"
             wrapped_session="${BASH_REMATCH[2]}"
+            wrapped_subject_session_count=$(
+                subject_session_count "$wrapped_subject"
+            )
 
-            # Validate this specific wrapper, not another directory sharing the
-            # same subject/session prefix.
-            local -a wrapped_matches=()
+            local -a wrapped_session_matches=()
+            local -a wrapped_shared_matches=()
 
             while IFS= read -r -d '' wrapped_anat; do
-                wrapped_matches+=("$wrapped_anat")
+                anat_dir_has_t1w "$wrapped_anat" || continue
+                wrapped_session_matches+=("$wrapped_anat")
             done < <(
                 find "$child_dir" \
                     -type d \
@@ -433,18 +601,48 @@ validate_input_subject_directories() {
                     -print0
             )
 
-            if (( ${#wrapped_matches[@]} == 1 )); then
+            if (( ${#wrapped_session_matches[@]} == 0 )) \
+                && (( wrapped_subject_session_count > 1 )) \
+                && [[ "${anat_outside_ses_enabled:-0}" == "1" ]]
+            then
+                while IFS= read -r -d '' wrapped_anat; do
+                    anat_dir_has_t1w "$wrapped_anat" || continue
+                    wrapped_shared_matches+=("$wrapped_anat")
+                done < <(
+                    find "$child_dir" \
+                        -type d \
+                        -path "*/${wrapped_subject}/anat" \
+                        -print0
+                )
+            fi
+
+            if (( ${#wrapped_session_matches[@]} == 1 )); then
                 ((wrapped_count += 1))
                 log_debug \
-                    "wrapped_session=$child_name anat=${wrapped_matches[0]}"
-            elif (( ${#wrapped_matches[@]} == 0 )); then
+                    "wrapped_session=$child_name anat=${wrapped_session_matches[0]}"
+            elif (( ${#wrapped_session_matches[@]} > 1 )); then
                 invalid_entries+=(
-                    "$child_dir :: missing nested ${wrapped_subject}/${wrapped_session}/anat directory"
+                    "$child_dir :: found multiple session anat directories containing _T1w.nii.gz"
                 )
+                ((invalid_count += 1))
+            elif (( ${#wrapped_shared_matches[@]} == 1 )); then
+                ((wrapped_count += 1))
+                log_debug \
+                    "wrapped_session=$child_name shared_anat=${wrapped_shared_matches[0]}"
+            elif (( ${#wrapped_shared_matches[@]} == 0 )); then
+                if (( wrapped_subject_session_count <= 1 )); then
+                    invalid_entries+=(
+                        "$child_dir :: a one-session subject must contain _T1w.nii.gz inside its session anat directory"
+                    )
+                else
+                    invalid_entries+=(
+                        "$child_dir :: no session-level or subject-level anat directory contains _T1w.nii.gz"
+                    )
+                fi
                 ((invalid_count += 1))
             else
                 invalid_entries+=(
-                    "$child_dir :: found multiple nested ${wrapped_subject}/${wrapped_session}/anat directories"
+                    "$child_dir :: found multiple subject-level anat directories containing _T1w.nii.gz"
                 )
                 ((invalid_count += 1))
             fi
@@ -452,7 +650,6 @@ validate_input_subject_directories() {
             continue
         fi
 
-        # Unrelated top-level directories are allowed.
         ignored_entries+=("$child_dir")
         ((ignored_count += 1))
         log_debug "Ignoring unrelated top-level directory: $child_dir"
@@ -467,13 +664,19 @@ validate_input_subject_directories() {
     if (( invalid_count > 0 )); then
         log_error "Input directory validation failed for $invalid_count path(s)."
         log_error "Supported layouts are:"
-        printf '  1. %s/sub-*/ses-*/**/anat\n' "$input_dir" >&2
-        printf '  2. %s/sub-*_ses-*[_suffix]/**/sub-*/ses-*/anat\n' \
+        printf '  1. %s/sub-*/ses-*/**/anat
+' "$input_dir" >&2
+        printf '  2. %s/sub-*/anat for shared longitudinal anatomy
+' \
+            "$input_dir" >&2
+        printf '  3. %s/sub-*_ses-*[_suffix]/**/sub-*/{ses-*/,}anat
+' \
             "$input_dir" >&2
 
         local entry
         for entry in "${invalid_entries[@]}"; do
-            printf '  - %s\n' "$entry" >&2
+            printf '  - %s
+' "$entry" >&2
         done
 
         return 1
@@ -481,8 +684,6 @@ validate_input_subject_directories() {
 
     if (( standard_count + wrapped_count == 0 )); then
         log_error "No valid subject/session directories were found in: $input_dir"
-        log_error \
-            "Expected either sub-*/ses-*/**/anat or sub-*_ses-*[_suffix]/**/sub-*/ses-*/anat."
         return 1
     fi
 
@@ -584,7 +785,6 @@ read_config() {
     gm_threshold=$(read_yaml '.settings.gm_threshold')
     dropout_percentile=$(read_yaml '.settings.dropout_percentile')
     mattes_bins=$(read_yaml '.settings.mattes_bins')
-    anat_earliest_ses=$(read_yaml '.settings.anat_earliest_ses // "no"')
     n_jobs=$(read_yaml '.parallelization.n_jobs')
 
     mkdir -p "$tmp_dir" "$output_dir"
@@ -618,7 +818,6 @@ PY
 check_inputs_global() {
     log_step "Validating configuration and input paths"
     require_dir "$input_dir" "input"
-    validate_input_subject_directories
 
     if [[ -z "$n_jobs" || "$n_jobs" == "null" ]]; then
         log_error "parallelization.n_jobs is missing from config."
@@ -635,13 +834,6 @@ check_inputs_global() {
         exit 1
     fi
 
-    case "${anat_earliest_ses,,}" in
-        yes|no) ;;
-        *)
-            log_error "settings.anat_earliest_ses must be 'yes' or 'no'."
-            exit 1
-            ;;
-    esac
 
     log_ok "Configuration validation passed"
 }
@@ -678,7 +870,7 @@ build_work_items() {
         return 1
     fi
 
-    log_step "Building one work item per functional entity combination"
+    log_step "Building one work item per filtered T1w/MNI functional combination"
 
     python - "$dataset_summary_json" >"$output_file" <<'PY'
 from __future__ import annotations
@@ -687,32 +879,56 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Any
+
 
 summary_path = Path(sys.argv[1])
-summary = json.loads(summary_path.read_text(encoding="utf-8"))
+summary = json.loads(
+    summary_path.read_text(encoding="utf-8")
+)
 
 NONE = "__NONE__"
 NO_RESOLUTION = "__NA__"
 
 ENTITY_PATTERNS = {
-    name: re.compile(rf"(?:^|_){name}-([^_.]+)")
-    for name in ("task", "acq", "run", "space", "res")
+    name: re.compile(
+        rf"(?:^|_){name}-([^_.]+)"
+    )
+    for name in (
+        "task",
+        "acq",
+        "run",
+        "space",
+        "res",
+    )
 }
 
 
-def values(value):
+def values(value: Any) -> list[Any]:
     if isinstance(value, list):
-        return [item for item in value if item not in (None, "")]
+        return [
+            item
+            for item in value
+            if item not in (None, "")
+        ]
+
     if value in (None, ""):
         return []
+
     return [value]
 
 
-def paths(value):
+def paths(value: Any) -> list[Path]:
     if isinstance(value, list):
-        return [Path(item) for item in value if item not in (None, "")]
+        return [
+            Path(item)
+            for item in value
+            if item not in (None, "")
+        ]
+
     if value in (None, ""):
         return []
+
     return [Path(value)]
 
 
@@ -721,68 +937,354 @@ def entity(filename: str, name: str) -> str:
     return match.group(1) if match else ""
 
 
-def token(value: str, missing: str = NONE) -> str:
-    return value if value else missing
-
-
-def normalize_resolution(value: object) -> str:
+def text(value: Any) -> str:
     if value in (None, ""):
         return ""
 
-    value = str(value)
+    return str(value)
+
+
+def token(
+    value: str,
+    missing: str = NONE,
+) -> str:
+    return value if value else missing
+
+
+def normalize_resolution(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+
+    normalized = str(value)
+
     try:
-        return str(int(value, 10))
+        return str(int(normalized, 10))
     except ValueError:
-        return value
+        return normalized
 
 
-records: set[tuple[str, str, str, str, str, str]] = set()
+def is_t1w_space(space: str) -> bool:
+    return space.casefold() == "t1w"
 
-for id_key, session in sorted(summary.get("session_summary", {}).items()):
+
+def is_mni_space(space: str) -> bool:
+    return "mni" in space.casefold()
+
+
+def is_allowed_space(space: str) -> bool:
+    return (
+        is_t1w_space(space)
+        or is_mni_space(space)
+    )
+
+
+def normalize_space(value: Any) -> str:
+    space = text(value)
+
+    if is_t1w_space(space):
+        return "T1w"
+
+    return space
+
+
+def natural_sort_key(value: Any) -> tuple:
+    parts = re.split(r"(\d+)", str(value))
+
+    return tuple(
+        (
+            0,
+            int(part),
+        )
+        if part.isdigit()
+        else (
+            1,
+            part.casefold(),
+        )
+        for part in parts
+        if part != ""
+    )
+
+
+def read_selected_combinations(
+    func: dict[str, Any],
+) -> set[tuple[str, str, str, str, str]]:
+    """Read exact filtered functional combinations from the summary."""
+    selected: set[
+        tuple[str, str, str, str, str]
+    ] = set()
+
+    combinations = func.get(
+        "selected_combinations",
+        [],
+    )
+
+    if not isinstance(combinations, list):
+        return selected
+
+    for combination in combinations:
+        if not isinstance(combination, dict):
+            continue
+
+        space = normalize_space(
+            combination.get("space")
+        )
+
+        # Native/no-space files are deliberately excluded. They are
+        # auxiliary inputs, not metric-space work items.
+        if not is_allowed_space(space):
+            continue
+
+        selected.add(
+            (
+                text(combination.get("task")),
+                text(combination.get("acq")),
+                text(combination.get("run")),
+                space,
+                normalize_resolution(
+                    combination.get("res")
+                ),
+            )
+        )
+
+    return selected
+
+
+def selected_resolutions_for(
+    selected_combinations: set[
+        tuple[str, str, str, str, str]
+    ],
+    *,
+    task: str,
+    acq: str,
+    run: str,
+    space: str,
+) -> set[str]:
+    """Return selected resolutions for one task/acq/run/space key."""
+    return {
+        selected_resolution
+        for (
+            selected_task,
+            selected_acq,
+            selected_run,
+            selected_space,
+            selected_resolution,
+        ) in selected_combinations
+        if (
+            selected_task == task
+            and selected_acq == acq
+            and selected_run == run
+            and selected_space == space
+        )
+    }
+
+
+def format_combination(
+    combination: tuple[str, str, str, str, str],
+) -> str:
+    task, acq, run, space, resolution = combination
+
+    return (
+        f"task={task or '<none>'}, "
+        f"acq={acq or '<none>'}, "
+        f"run={run or '<none>'}, "
+        f"space={space or '<none>'}, "
+        f"res={resolution or '<none>'}"
+    )
+
+
+records: set[
+    tuple[str, str, str, str, str, str]
+] = set()
+
+session_summary = summary.get(
+    "session_summary",
+    {},
+)
+
+if not isinstance(session_summary, dict):
+    raise SystemExit(
+        "dataset_summary.json does not contain a valid "
+        "session_summary object"
+    )
+
+session_items = sorted(
+    session_summary.items(),
+    key=lambda item: natural_sort_key(
+        item[0]
+    ),
+)
+
+for id_key, session in session_items:
+    if not isinstance(session, dict):
+        continue
+
     func = session.get("func", {}) or {}
+
+    if not isinstance(func, dict):
+        continue
+
     func_dirs = paths(func.get("path"))
-    summary_spaces = {str(item) for item in values(func.get("space"))}
+
+    # New summaries contain this field even when the selected list is empty.
+    # Its presence distinguishes the new filtered format from older summaries.
+    has_selected_combinations = (
+        "selected_combinations" in func
+    )
+
+    selected_combinations = (
+        read_selected_combinations(func)
+    )
+
+    # The filtered summary explicitly selected no functional T1w/MNI
+    # combinations for this session.
+    if (
+        has_selected_combinations
+        and not selected_combinations
+    ):
+        continue
+
+    if not func_dirs:
+        if has_selected_combinations:
+            raise SystemExit(
+                f"No functional path was recorded for selected "
+                f"session {id_key}"
+            )
+
+        continue
+
+    # Used only for summaries created before selected_combinations existed.
     summary_resolutions = {
         normalize_resolution(item)
         for item in values(func.get("res"))
     }
 
-    if not func_dirs:
-        raise SystemExit(f"No functional path was recorded for {id_key}")
+    session_records: set[
+        tuple[str, str, str, str, str, str]
+    ] = set()
 
-    session_records: set[tuple[str, str, str, str, str, str]] = set()
-    coreg_records: set[tuple[str, str, str]] = set()
+    matched_selected_combinations: set[
+        tuple[str, str, str, str, str]
+    ] = set()
 
     for func_dir in func_dirs:
         if not func_dir.is_dir():
             raise SystemExit(
-                f"Functional directory does not exist for {id_key}: {func_dir}"
+                f"Functional directory does not exist for "
+                f"{id_key}: {func_dir}"
             )
 
-        for file_path in sorted(func_dir.rglob("*boldref.nii.gz")):
+        boldref_files = sorted(
+            func_dir.rglob("*boldref.nii.gz"),
+            key=lambda path: natural_sort_key(
+                str(path)
+            ),
+        )
+
+        for file_path in boldref_files:
             filename = file_path.name
-            if not filename.startswith(id_key):
+
+            if not filename.startswith(
+                str(id_key)
+            ):
                 continue
 
             task = entity(filename, "task")
             acq = entity(filename, "acq")
             run = entity(filename, "run")
             space = entity(filename, "space")
-            resolution = normalize_resolution(entity(filename, "res"))
 
+            # No space-* means native functional space. Native is resolved
+            # later only when it is needed as an auxiliary NMI input.
             if not space:
-                if filename.endswith("desc-coreg_boldref.nii.gz"):
-                    coreg_records.add((task, acq, run))
                 continue
 
-            if not resolution and "MNI" in space.upper():
-                if len(summary_resolutions) == 1:
-                    resolution = next(iter(summary_resolutions))
-                elif len(summary_resolutions) > 1:
-                    raise SystemExit(
-                        f"Cannot determine resolution for {file_path}; "
-                        f"session summary contains {sorted(summary_resolutions)!r}"
+            if not is_allowed_space(space):
+                continue
+
+            normalized_space = normalize_space(
+                space
+            )
+
+            resolution = normalize_resolution(
+                entity(filename, "res")
+            )
+
+            if has_selected_combinations:
+                possible_resolutions = (
+                    selected_resolutions_for(
+                        selected_combinations,
+                        task=task,
+                        acq=acq,
+                        run=run,
+                        space=normalized_space,
                     )
+                )
+
+                # This task/acq/run/space combination was removed by the
+                # BIDS filter.
+                if not possible_resolutions:
+                    continue
+
+                if not resolution:
+                    # Prefer an explicitly resolution-free selection.
+                    if "" in possible_resolutions:
+                        resolution = ""
+                    else:
+                        nonempty_resolutions = {
+                            value
+                            for value in possible_resolutions
+                            if value
+                        }
+
+                        if len(nonempty_resolutions) == 1:
+                            resolution = next(
+                                iter(nonempty_resolutions)
+                            )
+                        else:
+                            raise SystemExit(
+                                f"Cannot determine the resolution for "
+                                f"{file_path}. The filtered combination "
+                                f"has multiple possible resolutions: "
+                                f"{sorted(nonempty_resolutions)!r}"
+                            )
+
+                candidate_combination = (
+                    task,
+                    acq,
+                    run,
+                    normalized_space,
+                    resolution,
+                )
+
+                if (
+                    candidate_combination
+                    not in selected_combinations
+                ):
+                    continue
+
+                matched_selected_combinations.add(
+                    candidate_combination
+                )
+
+            else:
+                # Compatibility with older summaries: an MNI boldref may
+                # omit res-* even though the session summary has one
+                # unambiguous resolution.
+                if (
+                    not resolution
+                    and is_mni_space(normalized_space)
+                ):
+                    if len(summary_resolutions) == 1:
+                        resolution = next(
+                            iter(summary_resolutions)
+                        )
+                    elif len(summary_resolutions) > 1:
+                        raise SystemExit(
+                            f"Cannot determine the resolution for "
+                            f"{file_path}. The session summary contains "
+                            f"multiple resolutions: "
+                            f"{sorted(summary_resolutions)!r}"
+                        )
 
             session_records.add(
                 (
@@ -790,48 +1292,56 @@ for id_key, session in sorted(summary.get("session_summary", {}).items()):
                     token(task),
                     token(acq),
                     token(run),
-                    space,
-                    token(resolution, NO_RESOLUTION),
+                    normalized_space,
+                    token(
+                        resolution,
+                        NO_RESOLUTION,
+                    ),
                 )
             )
 
-    # Some pipelines expose the T1w BOLD reference only as desc-coreg_boldref
-    # without an explicit space-T1w entity. Preserve it as a T1w work item when
-    # the dataset summary says T1w exists. If there are no explicit spaces at
-    # all, preserve it as native.
-    explicit_t1w_keys = {
-        (record[1], record[2], record[3])
-        for record in session_records
-        if record[4].upper() == "T1W"
-    }
-
-    fallback_space = "T1w" if "T1w" in summary_spaces else "native"
-    for task, acq, run in coreg_records:
-        key = (token(task), token(acq), token(run))
-        if key in explicit_t1w_keys:
-            continue
-        session_records.add(
-            (
-                str(id_key),
-                key[0],
-                key[1],
-                key[2],
-                fallback_space,
-                NO_RESOLUTION,
-            )
+    if has_selected_combinations:
+        missing_combinations = (
+            selected_combinations
+            - matched_selected_combinations
         )
+
+        if missing_combinations:
+            details = "\n".join(
+                f"  - {format_combination(combination)}"
+                for combination in sorted(
+                    missing_combinations,
+                    key=lambda item: tuple(
+                        natural_sort_key(value)
+                        for value in item
+                    ),
+                )
+            )
+
+            raise SystemExit(
+                f"Could not find a matching T1w/MNI boldref for "
+                f"the following filtered combinations in {id_key}:\n"
+                f"{details}"
+            )
 
     if not session_records:
-        raise SystemExit(
-            f"No functional BOLD-reference work items were found for {id_key}"
-        )
+        continue
 
     records.update(session_records)
 
 if not records:
-    raise SystemExit("No functional work items were discovered")
+    raise SystemExit(
+        "No explicit T1w or MNI functional BOLD-reference "
+        "work items were discovered after applying the BIDS filter"
+    )
 
-for record in sorted(records):
+for record in sorted(
+    records,
+    key=lambda item: tuple(
+        natural_sort_key(value)
+        for value in item
+    ),
+):
     print(*record, sep="\t")
 PY
 
@@ -841,7 +1351,17 @@ PY
     fi
 
     local count
-    count=$(awk 'NF {count++} END {print count+0}' "$output_file")
+    count=$(
+        awk '
+            NF {
+                count++
+            }
+            END {
+                print count + 0
+            }
+        ' "$output_file"
+    )
+
     log_ok "Built $count functional work item(s)"
 }
 
@@ -942,18 +1462,68 @@ resolve_subject_session_inputs() {
     local anat_dir_json func_dir_json
     local func_task_json
     local anat_acq_json
+    local recorded_anat_dir
+    local subject_id session_id
+    local anat_id_prefix
+
+    subject_id=$(jq -r --arg key "$id_key" \
+        '.session_summary[$key].subject // empty' "$dataset_summary_json")
+    session_id=$(jq -r --arg key "$id_key" \
+        '.session_summary[$key].session // empty' "$dataset_summary_json")
+
+    if [[ -z "$subject_id" ]]; then
+        subject_id=$(grep -oE '^sub-[A-Za-z0-9]+' <<<"$id_key" | head -n 1 || true)
+    fi
 
     anat_dir_json=$(jq -c --arg key "$id_key" \
         '.session_summary[$key].anat.path // null' "$dataset_summary_json")
     func_dir_json=$(jq -c --arg key "$id_key" \
         '.session_summary[$key].func.path // null' "$dataset_summary_json")
 
-    anat_dir=$(json_single_value "$anat_dir_json" "anat.path" "$id_key")
-    func_dir=$(json_single_value "$func_dir_json" "func.path" "$id_key")
+    recorded_anat_dir=$(json_single_value \
+        "$anat_dir_json" "anat.path" "$id_key")
+    func_dir=$(json_single_value \
+        "$func_dir_json" "func.path" "$id_key")
+
+    anat_dir=""
+    anat_outside_ses_for_item=0
+
+    if anat_dir_has_t1w "$recorded_anat_dir"; then
+        anat_dir="$recorded_anat_dir"
+    elif [[ "${anat_outside_ses_enabled:-0}" == "1" ]] \
+        && [[ -n "$subject_id" && -n "$session_id" ]]
+    then
+        if ! anat_dir=$(find_session_anat_dir \
+            "$subject_id" "$session_id")
+        then
+            log_error \
+                "Could not resolve session or shared longitudinal anatomy for $id_key."
+            return 1
+        fi
+    fi
 
     if [[ -z "$anat_dir" || -z "$func_dir" ]]; then
-        log_error "Could not read anat/func paths for $id_key."
+        log_error "Could not read usable anat/func paths for $id_key."
         return 1
+    fi
+
+    if [[ -n "$session_id" ]]; then
+        case "/${anat_dir%/}/" in
+            *"/$session_id/"*)
+                anat_outside_ses_for_item=0
+                ;;
+            *)
+                if [[ "${anat_outside_ses_enabled:-0}" == "1" ]]; then
+                    anat_outside_ses_for_item=1
+                fi
+                ;;
+        esac
+    fi
+
+    if (( anat_outside_ses_for_item )); then
+        anat_id_prefix="$subject_id"
+    else
+        anat_id_prefix="$id_key"
     fi
 
     func_task_json=$(jq -c --arg key "$id_key" \
@@ -963,9 +1533,6 @@ resolve_subject_session_inputs() {
 
     anat_acq=$(json_single_value "$anat_acq_json" "anat.acq" "$id_key")
 
-    # The work-item manifest already carries the concrete task. Consult the
-    # session summary only for older summaries/jobs that do not provide one.
-    # This avoids rejecting sessions whose func.task field is an array.
     if [[ -z "$func_task" ]]; then
         func_task=$(json_single_value "$func_task_json" "func.task" "$id_key")
     fi
@@ -986,7 +1553,14 @@ resolve_subject_session_inputs() {
     local func_space_spec="__NONE__"
     local func_res_spec="__ANY__"
 
-    [[ -n "$anat_acq" ]] && anat_acq_spec="$anat_acq"
+    # Session summaries do not inventory subject-level anat directories.
+    # Let the unique-file resolver determine acquisition in that case.
+    if (( anat_outside_ses_for_item )); then
+        anat_acq_spec="__ANY__"
+    elif [[ -n "$anat_acq" ]]; then
+        anat_acq_spec="$anat_acq"
+    fi
+
     [[ -n "$func_task" ]] && task_spec="$func_task"
     [[ -n "$func_acq" ]] && func_acq_spec="$func_acq"
     [[ -n "$func_run" ]] && func_run_spec="$func_run"
@@ -994,17 +1568,17 @@ resolve_subject_session_inputs() {
     [[ -n "$func_res" ]] && func_res_spec="$func_res"
 
     anat_t1=$(find_single_bids_file \
-        "$anat_dir" "$id_key" "desc-preproc_T1w.nii.gz" \
+        "$anat_dir" "$anat_id_prefix" "desc-preproc_T1w.nii.gz" \
         "native anatomical T1w" \
         __ANY__ "$anat_acq_spec" __ANY__ __NONE__ __ANY__)
 
     mask_anat_native=$(find_single_bids_file \
-        "$anat_dir" "$id_key" "desc-brain_mask.nii.gz" \
+        "$anat_dir" "$anat_id_prefix" "desc-brain_mask.nii.gz" \
         "native anatomical brain mask" \
         __ANY__ "$anat_acq_spec" __ANY__ __NONE__ __ANY__)
 
     gm_seg_native=$(find_single_bids_file \
-        "$anat_dir" "$id_key" "label-GM_probseg.nii.gz" \
+        "$anat_dir" "$anat_id_prefix" "label-GM_probseg.nii.gz" \
         "native anatomical GM probability map" \
         __ANY__ "$anat_acq_spec" __ANY__ __NONE__ __ANY__)
 
@@ -1048,49 +1622,50 @@ resolve_subject_session_inputs() {
             "$func_space_spec" __ANY__)
     fi
 
-    if ! refbold=$(find_single_bids_file \
-        "$func_dir" "$id_key" "desc-coreg_boldref.nii.gz" \
-        "native/coregistered BOLD reference" \
-        "$task_spec" "$func_acq_spec" "$func_run_spec" \
-        __NONE__ __ANY__ optional)
-    then
-        refbold="$refbold_space"
-    fi
-
     if is_mni_space "$func_space"; then
         anat_space="$func_space"
 
         if ! anat_mni=$(find_single_bids_file \
-            "$anat_dir" "$id_key" "desc-preproc_T1w.nii.gz" \
+            "$anat_dir" "$anat_id_prefix" "desc-preproc_T1w.nii.gz" \
             "anatomical T1w in $func_space" \
             __ANY__ "$anat_acq_spec" __ANY__ "$func_space" "$func_res_spec" optional)
         then
             anat_mni=$(find_single_bids_file \
-                "$anat_dir" "$id_key" "desc-preproc_T1w.nii.gz" \
+                "$anat_dir" "$anat_id_prefix" "desc-preproc_T1w.nii.gz" \
                 "anatomical T1w in $func_space" \
                 __ANY__ "$anat_acq_spec" __ANY__ "$func_space" __ANY__)
         fi
 
         if ! mask_anat_mni=$(find_single_bids_file \
-            "$anat_dir" "$id_key" "desc-brain_mask.nii.gz" \
+            "$anat_dir" "$anat_id_prefix" "desc-brain_mask.nii.gz" \
             "anatomical brain mask in $func_space" \
             __ANY__ "$anat_acq_spec" __ANY__ "$func_space" "$func_res_spec" optional)
         then
             mask_anat_mni=$(find_single_bids_file \
-                "$anat_dir" "$id_key" "desc-brain_mask.nii.gz" \
+                "$anat_dir" "$anat_id_prefix" "desc-brain_mask.nii.gz" \
                 "anatomical brain mask in $func_space" \
                 __ANY__ "$anat_acq_spec" __ANY__ "$func_space" __ANY__)
         fi
 
         if ! gm_seg_mni=$(find_single_bids_file \
-            "$anat_dir" "$id_key" "label-GM_probseg.nii.gz" \
+            "$anat_dir" "$anat_id_prefix" "label-GM_probseg.nii.gz" \
             "anatomical GM probability map in $func_space" \
             __ANY__ "$anat_acq_spec" __ANY__ "$func_space" "$func_res_spec" optional)
         then
             gm_seg_mni=$(find_single_bids_file \
-                "$anat_dir" "$id_key" "label-GM_probseg.nii.gz" \
+                "$anat_dir" "$anat_id_prefix" "label-GM_probseg.nii.gz" \
                 "anatomical GM probability map in $func_space" \
                 __ANY__ "$anat_acq_spec" __ANY__ "$func_space" __ANY__)
+        fi
+
+        if ! refbold_native=$(find_single_bids_file \
+            "$func_dir" "$id_key" "desc-coreg_boldref.nii.gz" \
+            "native/coregistered BOLD reference" \
+            "$task_spec" "$func_acq_spec" "$func_run_spec" \
+            __NONE__ __ANY__)
+        then
+            log_error "Could not find native/coregistered BOLD reference for $id_key"
+            return 1
         fi
 
         mask_func_mni="$mask_func_space"
@@ -1104,10 +1679,18 @@ resolve_subject_session_inputs() {
         mask_func_mni=""
         refbold_mni=""
         mask_func_native="$mask_func_space"
+        refbold_native="$refbold_space"
     fi
 
     log_ok "Input files resolved"
     log_info "Entities: task=${func_task:-<none>} acq=${func_acq:-<none>} run=${func_run:-<none>} space=${func_space:-native} res=${func_res:-<none>}"
+    log_info \
+        "Anatomy source: $([[ $anat_outside_ses_for_item -eq 1 ]] && printf 'subject-level anat outside ses-*' || printf 'session-level anat')"
+    log_debug "dataset_type=${dataset_type:-unknown}"
+    log_debug "anat_outside_ses_summary=${anat_outside_ses_summary:-null}"
+    log_debug "anat_outside_ses_enabled=${anat_outside_ses_enabled:-0}"
+    log_debug "anat_outside_ses_for_item=$anat_outside_ses_for_item"
+    log_debug "anat_id_prefix=$anat_id_prefix"
     log_debug "anat_dir=$anat_dir"
     log_debug "func_dir=$func_dir"
     log_debug "anat_t1=$anat_t1"
@@ -1116,7 +1699,7 @@ resolve_subject_session_inputs() {
     log_debug "matrix=$matrix"
     log_debug "mask_func_space=$mask_func_space"
     log_debug "refbold_space=$refbold_space"
-    log_debug "refbold=$refbold"
+    log_debug "refbold_native=$refbold_native"
     log_debug "anat_mni=${anat_mni:-}"
     log_debug "mask_anat_mni=${mask_anat_mni:-}"
     log_debug "gm_seg_mni=${gm_seg_mni:-}"
@@ -1165,10 +1748,11 @@ publish_worker_metric_csvs() {
 
 process_subject_session() {
     id_key="${1:-}"
+
     local task_token="${2:-__NONE__}"
     local acq_token="${3:-__NONE__}"
     local run_token="${4:-__NONE__}"
-    local space_token="${5:-native}"
+    local space_token="${5:-__NONE__}"
     local resolution_token="${6:-__NA__}"
 
     if [[ -z "$id_key" ]]; then
@@ -1187,33 +1771,51 @@ process_subject_session() {
     func_space="$space_token"
     func_res=""
 
-    [[ "$task_token" != "__NONE__" ]] && func_task="$task_token"
-    [[ "$acq_token" != "__NONE__" ]] && func_acq="$acq_token"
-    [[ "$run_token" != "__NONE__" ]] && func_run="$run_token"
-    [[ "$resolution_token" != "__NA__" ]] && func_res="$resolution_token"
+    if [[ "$task_token" != "__NONE__" ]]; then
+        func_task="$task_token"
+    fi
+
+    if [[ "$acq_token" != "__NONE__" ]]; then
+        func_acq="$acq_token"
+    fi
+
+    if [[ "$run_token" != "__NONE__" ]]; then
+        func_run="$run_token"
+    fi
+
+    if [[ "$resolution_token" != "__NA__" ]]; then
+        func_res="$resolution_token"
+    fi
 
     task="$func_task"
     acq="$func_acq"
     run="$func_run"
     space="$func_space"
     resolution="$func_res"
+
     export task acq run space resolution
 
     local work_item_id="$id_key"
     work_item_id+="_task-${func_task:-none}"
     work_item_id+="_acq-${func_acq:-none}"
     work_item_id+="_run-${func_run:-none}"
-    work_item_id+="_space-${func_space:-native}"
+    work_item_id+="_space-${func_space:-none}"
     work_item_id+="_res-${func_res:-none}"
 
     id_tmp_dir="$work_dir/$work_item_id"
-    rm -rf "$id_tmp_dir"
-    mkdir -p "$id_tmp_dir"
+
+    rm -rf -- "$id_tmp_dir"
+    mkdir -p -- "$id_tmp_dir"
 
     cleanup_subject_tmp() {
-        rm -rf "$id_tmp_dir"
+        rm -rf -- "$id_tmp_dir"
     }
-    trap cleanup_subject_tmp RETURN
+
+    if [[ "${no_temp_cleanup:-0}" == "1" ]]; then
+        log_info "Temporary work files will be kept: $id_tmp_dir"
+    else
+        trap cleanup_subject_tmp RETURN
+    fi
 
     LOG_CONTEXT="$work_item_id"
     log_section "Processing $work_item_id"
@@ -1227,15 +1829,29 @@ process_subject_session() {
     dice_dir="$metrics_dir/dice"
     dropout_dir="$metrics_dir/dropout"
     nmi_dir="$metrics_dir/nmi"
-    mkdir -p "$dice_dir" "$dropout_dir" "$nmi_dir"
+
+    mkdir -p \
+        "$dice_dir" \
+        "$dropout_dir" \
+        "$nmi_dir"
 
     resolve_subject_session_inputs
     select_metric_space_files
 
-    log_step "Checking that resolved files belong to the expected subject/session"
-    if [[ "${anat_earliest_ses,,}" == "yes" ]]; then
+    log_step \
+        "Checking that resolved files belong to the expected subject/session"
+
+    if (( anat_outside_ses_for_item )); then
+        local expected_subject
+        expected_subject=$(extract_sub_id "$id_key")
+
+        if [[ -z "$expected_subject" ]]; then
+            log_error "Could not extract subject ID from work item: $id_key"
+            return 1
+        fi
+
         check_matching_subjects \
-            "$id_key" \
+            "$expected_subject" \
             "$mask_anat_space" \
             "$mask_func_space" \
             "$refbold_space" \
@@ -1247,21 +1863,55 @@ process_subject_session() {
             "$refbold_space" \
             "$gm_seg_space"
     fi
+
     log_ok "Input identity checks passed"
 
-    echo "mask_anat_space=$mask_anat_space"
-    echo "mask_func_space=$mask_func_space"
-    echo "refbold_space=$refbold_space"
-    echo "gm_seg_space=$gm_seg_space"
+    log_debug "mask_anat_space=$mask_anat_space"
+    log_debug "mask_func_space=$mask_func_space"
+    log_debug "refbold_space=$refbold_space"
+    log_debug "gm_seg_space=$gm_seg_space"
 
-    # if space doesnt contain mni, then apply function to resample to t1
-    if [[ "$func_space" != *"MNI"* ]]; then
-        ref_img="$mask_anat_space"
-        echo "$ref_img"
-        resample_to_t1 $mask_func_space $refbold_space $ref_img
-        mask_func_space=$mask_func_anatres
-        refbold_space=$refbold_anatres
-    fi
+    case "$func_space" in
+        T1w)
+            # The functional files are already in T1w coordinates, but they
+            # may have a different voxel grid or resolution from the
+            # anatomical T1w image. Resample them onto the anatomical grid
+            # before calculating Dice and dropout.
+            local ref_img="$mask_anat_space"
+
+            log_step \
+                "Resampling T1w-spaced functional inputs to the T1w grid"
+
+            if ! resample_to_t1 \
+                "$mask_func_space" \
+                "$refbold_native" \
+                "$ref_img"
+            then
+                log_error \
+                    "Could not resample T1w functional inputs to the anatomical grid"
+                return 1
+            fi
+
+            # mask_func_space="$mask_func_anatres"
+            # refbold_native="$refbold_anatres"
+
+            log_debug \
+                "resampled_mask_func_space=$mask_func_space"
+            log_debug \
+                "resampled_refbold_native=$refbold_native"
+            ;;
+
+        *MNI*)
+            # MNI functional inputs and MNI anatomical inputs are already
+            # selected at their requested template space and resolution.
+            ;;
+
+        *)
+            log_error \
+                "Unsupported functional work-item space: ${func_space:-<empty>}"
+            return 1
+            ;;
+    esac
 
     if ! extract_dice_metric \
         "$id_key" \
@@ -1289,31 +1939,33 @@ process_subject_session() {
         return 1
     fi
 
-    local refbold_t1space
-    if ! refbold_t1space=$(transform_bold_t1space \
-        "$id_key" \
-        "$gm_seg_space" \
-        "$mask_anat_space" \
-        "$mask_func_space" \
-        "$refbold_space" \
-        "$metric_space" \
-        "$func_task" \
-        "$func_acq")
-    then
-        log_error "BOLD-to-T1 transform failed"
-        return 1
-    fi
-
+    # TemplateFlow and NMI processing apply only to MNI work items.
     if is_mni_space "$metric_space"; then
+        local refbold_t1space
+
+        if ! refbold_t1space=$(
+            transform_bold_t1space \
+                "$id_key" \
+                "$anat_t1" \
+                "$matrix" \
+                "$refbold_native"
+        )
+        then
+            log_error "BOLD-to-T1 transform failed"
+            return 1
+        fi
+
         local template_space="$func_space"
         local template_resolution="$func_res"
 
         if [[ -z "$template_resolution" ]]; then
-            log_error "Missing template resolution for MNI work item: $work_item_id"
+            log_error \
+                "Missing template resolution for MNI work item: $work_item_id"
             return 1
         fi
 
         local entropy_mni
+
         if ! entropy_mni=$(
             lookup_template_entropy \
                 "$template_space" \
@@ -1324,23 +1976,34 @@ process_subject_session() {
             return 1
         fi
 
-        local res_label template_t1 template_mask
-        if ! res_label=$(templateflow_resolution_label "$template_resolution"); then
+        local res_label
+        local template_t1
+        local template_mask
+
+        if ! res_label=$(
+            templateflow_resolution_label \
+                "$template_resolution"
+        )
+        then
             log_error "Could not format template resolution"
             return 1
         fi
 
-        if ! template_t1=$(find_single_file \
-            "$templateflow_dir" \
-            "tpl-${template_space}_res-${res_label}_T1w.nii.gz")
+        if ! template_t1=$(
+            find_single_file \
+                "$templateflow_dir" \
+                "tpl-${template_space}_res-${res_label}_T1w.nii.gz"
+        )
         then
             log_error "Could not locate TemplateFlow T1"
             return 1
         fi
 
-        if ! template_mask=$(find_single_file \
-            "$templateflow_dir" \
-            "tpl-${template_space}_res-${res_label}_desc-brain_mask.nii.gz")
+        if ! template_mask=$(
+            find_single_file \
+                "$templateflow_dir" \
+                "tpl-${template_space}_res-${res_label}_desc-brain_mask.nii.gz"
+        )
         then
             log_error "Could not locate TemplateFlow mask"
             return 1
@@ -1363,15 +2026,24 @@ process_subject_session() {
             return 1
         fi
     else
-        log_info "Skipping TemplateFlow NMI for non-MNI space: $metric_space"
+        log_info \
+            "Skipping TemplateFlow NMI for non-MNI space: $metric_space"
     fi
 
     publish_worker_metric_csvs \
-        "$dice_dir" "$central_dice_dir" "$work_item_id"
+        "$dice_dir" \
+        "$central_dice_dir" \
+        "$work_item_id"
+
     publish_worker_metric_csvs \
-        "$dropout_dir" "$central_dropout_dir" "$work_item_id"
+        "$dropout_dir" \
+        "$central_dropout_dir" \
+        "$work_item_id"
+
     publish_worker_metric_csvs \
-        "$nmi_dir" "$central_nmi_dir" "$work_item_id"
+        "$nmi_dir" \
+        "$central_nmi_dir" \
+        "$work_item_id"
 
     metrics_dir="$central_metrics_dir"
     dice_dir="$central_dice_dir"
@@ -1508,9 +2180,11 @@ export_parallel_context() {
     export SHELL=/bin/bash
 
     export config_file
+    export no_temp_cleanup
     export tmp_dir output_dir extracted_metrics_file input_dir
     export templateflow_dir dataset_summary_json entropy_lookup_tsv
-    export gm_threshold dropout_percentile mattes_bins anat_earliest_ses
+    export dataset_type anat_outside_ses_summary anat_outside_ses_enabled
+    export gm_threshold dropout_percentile mattes_bins
     export metrics_dir dice_dir dropout_dir nmi_dir work_dir
     export VERBOSE LOG_TIMESTAMPS
     export C_RESET C_BOLD C_DIM C_RED C_GREEN C_YELLOW C_BLUE C_MAGENTA C_CYAN
@@ -1522,9 +2196,10 @@ export_parallel_context() {
     export -f resolve_glob_one find_single_file find_single_dir
     export -f extract_sub_id extract_ses_id
     export -f check_matching_ids check_matching_subjects
-    export -f get_earliest_anat_dir
 
     export -f is_mni_space json_single_value normalize_resolution
+    export -f anat_dir_has_t1w subject_session_count
+    export -f find_wrapped_session_anat_dir find_session_anat_dir
     export -f templateflow_resolution_label lookup_template_entropy
     export -f bids_entity_value entity_spec_matches find_single_bids_file
     export -f resolve_subject_session_inputs select_metric_space_files
@@ -1547,12 +2222,33 @@ run_dataset() {
     log_info "Final CSV: $extracted_metrics_file"
     log_info "Parallel jobs: $n_jobs"
 
+    if (( no_temp_cleanup )); then
+        log_info "Cleanup of temporary files: disabled"
+    else
+        log_info "Cleanup of temporary files: enabled"
+    fi
+
     local subject_id_keys_file="$tmp_dir/subject_id_keys.txt"
     work_items_tsv="$tmp_dir/functional_work_items.tsv"
     dataset_summary_json="$tmp_dir/dataset_summary.json"
 
     log_step "Exploring dataset structure"
-    python "$script_dir/dataset_utils.py" "$input_dir" >"$dataset_summary_json"
+    structure_command=(
+        python
+        "$script_dir/dataset_utils.py"
+        "$input_dir"
+    )
+
+    if [[ -n "${bids_filter:-}" ]]; then
+        structure_command+=(
+            --bids-filter
+            "$bids_filter"
+        )
+        log_ok "BIDS filter detected: $bids_filter"
+    fi
+
+    "${structure_command[@]}" >"$dataset_summary_json"
+
     log_ok "Dataset summary written: $dataset_summary_json"
 
     if ! jq -e '.session_summary | type == "object"' \
@@ -1560,6 +2256,61 @@ run_dataset() {
         log_error "dataset_utils.py did not produce a session_summary object."
         exit 1
     fi
+
+    dataset_type=$(jq -r '.dataset_type // "unknown"' \
+        "$dataset_summary_json")
+    anat_outside_ses_summary=$(jq -c '.anat_outside_ses // null' \
+        "$dataset_summary_json")
+
+    case "$dataset_type" in
+        longitudinal|cross_sectional|unknown) ;;
+        *)
+            log_error "Unsupported dataset_type in dataset summary: $dataset_type"
+            exit 1
+            ;;
+    esac
+
+    if [[ "$dataset_type" != "longitudinal" \
+        && "$anat_outside_ses_summary" != "null" ]]
+    then
+        log_error \
+            "anat_outside_ses must be null unless dataset_type is longitudinal."
+        exit 1
+    fi
+
+    if [[ "$dataset_type" == "longitudinal" ]] \
+        && ! jq -e '
+            (.anat_outside_ses | type) == "array"
+            and (.anat_outside_ses | length) == 1
+            and (
+                .anat_outside_ses[0] == "yes"
+                or .anat_outside_ses[0] == "no"
+            )
+        ' "$dataset_summary_json" >/dev/null
+    then
+        log_error \
+            "Longitudinal anat_outside_ses must be exactly [\"yes\"] or [\"no\"]."
+        exit 1
+    fi
+
+    anat_outside_ses_enabled=0
+    if [[ "$dataset_type" == "longitudinal" ]] \
+        && jq -e '.anat_outside_ses == ["yes"]' \
+            "$dataset_summary_json" >/dev/null
+    then
+        anat_outside_ses_enabled=1
+    fi
+
+    log_info "Dataset type: $dataset_type"
+    if [[ "$dataset_type" == "longitudinal" ]]; then
+        log_info "Shared anatomy summary: $anat_outside_ses_summary"
+        log_info \
+            "Subject-level anatomy fallback: $([[ $anat_outside_ses_enabled -eq 1 ]] && printf enabled || printf disabled)"
+    fi
+
+    # The layout validator needs the discovered dataset-level anatomy mode,
+    # so run it only after dataset_summary.json has been parsed.
+    validate_input_subject_directories
 
     jq -r '.session_summary | keys[]' "$dataset_summary_json" \
         | sort >"$subject_id_keys_file"
@@ -1641,7 +2392,6 @@ main() {
     log_debug "gm_threshold=$gm_threshold"
     log_debug "dropout_percentile=$dropout_percentile"
     log_debug "mattes_bins=$mattes_bins"
-    log_debug "anat_earliest_ses=$anat_earliest_ses"
 
     check_inputs_global
     run_dataset

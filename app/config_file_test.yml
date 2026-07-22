@@ -1,7 +1,7 @@
 # user action: Configure the paths and settings for the vaqcuum pipeline
 
 paths:
-  input_dir: "/Users/ga0034de/Desktop/lea_a4"
+  input_dir: "/Users/ga0034de/Desktop/jon_vallecas"
 
   output_dir: "/Users/ga0034de/Desktop/test_output"
   extracted_metrics_file: "{output_dir}/extracted_metrics.csv"
@@ -9,22 +9,23 @@ paths:
   tmp_dir: "/Users/ga0034de/Desktop/test_temp"
 
   # if internet, fetch template flow
-  # provide templateflow path, then grep mni type from ders
+  # provide templateflow path
   templateflow_dir: ""
-
-  # Reference images
-  # mni: "/Users/ga0034de/Downloads/templateflow/tpl-MNI152NLin6Asym/tpl-MNI152NLin6Asym_res-02_T1w.nii.gz"
-  # mni_mask: "/Users/ga0034de/Downloads/templateflow/tpl-MNI152NLin6Asym/tpl-MNI152NLin6Asym_res-02_desc-brain_mask.nii.gz"
-  # mni_type_res: "MNI152NLin6Asym_res-2"
-
 
   # if your nested derivative structure has processed anat scans in the first session folder only (fmriprep's design), set this to "yes". If not, set to "no"
   #anat_earliest_ses: "no"
 
 parallelization:
-  n_jobs: 1
+  n_jobs: 5
 
 
+settings:
+# parameters for metrics extraction should be hardcoded for now
+  gm_threshold: 0.3
+  dropout_percentile: 10
+  mattes_bins: 64
+
+  #should we also output scanwise metrics. 
 
 # ================
 # TBD
@@ -40,17 +41,3 @@ parallelization:
 #   bold:
 #     task: "rest" #make *
 #     acquisition: "*"
-
-
-
-settings:
-# parameters for metrics extraction should be hardcoded for now
-  gm_threshold: 0.3
-  dropout_percentile: 10
-  mattes_bins: 64
-
-  #should we also output scanwise metrics. 
-  # save or delete files?
-
-  #bids filter?
-  # if user didnt ask for native space, does nmi t1-boldref is performed in given space or do we transfrom to t1 space and then perform nmi t1-boldref, even tho user didnt ask for native space?

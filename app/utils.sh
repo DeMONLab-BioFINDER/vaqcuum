@@ -220,7 +220,7 @@ check_matching_ids() {
     done
 }
 
-# Verify that all files belong to the expected subject.
+#Verify that all files belong to the expected subject.
 check_matching_subjects() {
     local expected_sub="$1"
     shift
