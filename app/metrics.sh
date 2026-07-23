@@ -63,7 +63,7 @@ extract_dice_metric() {
     intersection_voxels=$(fslstats "$intersection" -V | awk '{print $1}')
 
     dice_val=$(python3 -c \
-        "print(round(2 * $intersection_voxels / ($anat_voxels + $func_voxels), 3))")
+        "print(round(2 * $intersection_voxels / ($anat_voxels + $func_voxels), 6))")
 
     rm -f "$intersection"
 
@@ -85,7 +85,7 @@ extract_dropout_metric() {
     local gm_seg_file="$2"
     local anat_mask_mni="$3"
     local func_mask_mni="$4"
-    local refbold_mni_file="$5"
+    local refbold_file="$5"
     local space="${6:-}"
     local task="${7:-}"
     local acq="${8:-}"
@@ -124,7 +124,7 @@ extract_dropout_metric() {
     log_debug "Dropout GM segmentation: $gm_seg_file"
     log_debug "Dropout anatomical mask: $anat_mask_mni"
     log_debug "Dropout functional mask: $func_mask_mni"
-    log_debug "Dropout BOLD reference: $refbold_mni_file"
+    log_debug "Dropout BOLD reference: $refbold_file"
 
     fslmaths "$gm_seg_file" \
         -thr "$gm_threshold" \
@@ -135,7 +135,7 @@ extract_dropout_metric() {
         -thr 1 \
         -bin "$mask_merged"
 
-    fslmaths "$refbold_mni_file" \
+    fslmaths "$refbold_file" \
         -mul "$mask_merged" \
         "$refbold_masked"
 
@@ -169,8 +169,8 @@ extract_dropout_metric() {
         -sub "$mask_dropout" \
         "$mask_gm_thr_clean"
 
-    intensity_gm=$(fslstats "$refbold_mni_file" -k "$mask_gm_thr_clean" -M)
-    intensity_dropout=$(fslstats "$refbold_mni_file" -k "$mask_dropout" -M)
+    intensity_gm=$(fslstats "$refbold_file" -k "$mask_gm_thr_clean" -M)
+    intensity_dropout=$(fslstats "$refbold_file" -k "$mask_dropout" -M)
 
     dropout_intensity=$(python3 - "$intensity_dropout" "$intensity_gm" <<'PY'
 import sys
@@ -240,12 +240,40 @@ transform_bold_t1space() {
     local t1="$2"
     local matrix="$3"
     local refbold_file="$4"
+    local existing_t1w_boldref="${5:-}"
 
     local bold_t1space
 
+    # Prefer an already available BOLD reference in T1w space.
+    if [[ -n "$existing_t1w_boldref" && -f "$existing_t1w_boldref" ]]; then
+        log_step "Registration: using existing BOLD reference in T1w space"
+        log_debug "Existing T1w-space BOLD reference: $existing_t1w_boldref"
+
+        printf '%s\n' "$existing_t1w_boldref"
+        return 0
+    fi
+
+    # The provided reference may itself already be in T1w space.
+    if [[ -f "$refbold_file" && "$(basename "$refbold_file")" == *_space-T1w_* ]]; then
+        log_step "Registration: BOLD reference is already in T1w space"
+        log_debug "T1w-space BOLD reference: $refbold_file"
+
+        printf '%s\n' "$refbold_file"
+        return 0
+    fi
+
     bold_t1space="${id_tmp_dir}/${id_key}_space-T1w_desc-coreg_boldref.nii.gz"
 
-    log_step "Registration: transforming BOLD reference into T1 space"
+    # Reuse a previously generated transform output.
+    if [[ -f "$bold_t1space" ]]; then
+        log_step "Registration: reusing transformed BOLD reference in T1w space"
+        log_debug "Transformed BOLD reference: $bold_t1space"
+
+        printf '%s\n' "$bold_t1space"
+        return 0
+    fi
+
+    log_step "Registration: transforming BOLD reference into T1w space"
     log_debug "Transform input BOLD: $refbold_file"
     log_debug "Transform reference T1: $t1"
     log_debug "Transform matrix: $matrix"
@@ -258,8 +286,10 @@ transform_bold_t1space() {
         -t "$matrix" \
         --interpolation LanczosWindowedSinc \
         >&2
+
     log_ok "BOLD-to-T1 transform complete"
     log_debug "Transformed BOLD reference: $bold_t1space"
+
     printf '%s\n' "$bold_t1space"
 }
 
@@ -444,9 +474,10 @@ def numeric_col(df: pd.DataFrame, col: str) -> pd.Series:
 
 
 def safe_nmi(entropy_a: pd.Series, entropy_b: pd.Series, mattes_term: pd.Series) -> pd.Series:
-    out = (round((2*mattes_term) / (entropy_a + entropy_b), 3))
+    out = (2*mattes_term) / (entropy_a + entropy_b)
     out = out.replace([np.inf, -np.inf], np.nan)
-    out = -1 * out
+    # making NMI the higher the better. Multiple by 10 to also make it more comparable
+    out = round((-1 * 10 * out), 6)
     return out
 
 
@@ -471,7 +502,7 @@ dropout["dropout_intensity"] = dropout["intensity_dropout"] / dropout["intensity
 dropout["dropout_size"] = dropout["volume_dropout"] / dropout["volume_gm"]
 dropout["dropout_compo"] = (1 - dropout["dropout_intensity"]) + dropout["dropout_size"]
 
-dropout = round(dropout.replace([np.inf, -np.inf], np.nan), 3)
+dropout = round(dropout.replace([np.inf, -np.inf], np.nan), 6)
 
 # Keep only this dropout metric in the final merged CSV
 dropout = dropout[keys + ["dropout_compo"]].copy()

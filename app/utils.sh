@@ -303,7 +303,8 @@ get_earliest_anat_dir() {
 resample_to_t1() {
     local mask_func_space="$1"
     local refbold_space="$2"
-    local reference_file="$3"
+    local ref_anatmask="$3"
+    local ref_t1="$4"
 
     mask_func_anatres=${mask_func_space%.nii.gz}_anatres.nii.gz
     refbold_anatres=${refbold_space%.nii.gz}_anatres.nii.gz
@@ -316,14 +317,14 @@ resample_to_t1() {
     antsApplyTransforms \
         -d 3 \
         -i "$mask_func_space" \
-        -r "$reference_file" \
+        -r "$ref_anatmask" \
         -o "$mask_func_anatres" \
         -n NearestNeighbor
 
     antsApplyTransforms \
         -d 3 \
         -i "$refbold_space" \
-        -r "$reference_file" \
+        -r "$ref_t1" \
         -o "$refbold_anatres" \
         -n BSpline
 }

@@ -1642,6 +1642,13 @@ resolve_subject_session_inputs() {
     local subject_id session_id
     local anat_id_prefix
 
+    # These are resolved conditionally for MNI NMI processing. When an
+    # entity-matched BOLD reference already exists in T1w space, neither the
+    # native/coregistered BOLD reference nor its transform matrix is needed.
+    matrix=""
+    refbold_native=""
+    refbold_t1w=""
+
     subject_id=$(jq -r --arg key "$id_key" \
         '.session_summary[$key].subject // empty' "$dataset_summary_json")
     session_id=$(jq -r --arg key "$id_key" \
@@ -1758,20 +1765,6 @@ resolve_subject_session_inputs() {
         "native anatomical GM probability map" \
         __ANY__ "$anat_acq_spec" __ANY__ __NONE__ __ANY__)
 
-    if ! matrix=$(find_single_bids_file \
-        "$func_dir" "$id_key" \
-        "from-boldref_to-T1w_mode-image_desc-coreg_xfm.txt" \
-        "entity-specific BOLD-to-T1w transform" \
-        "$task_spec" "$func_acq_spec" "$func_run_spec" \
-        __NONE__ __ANY__ optional)
-    then
-        matrix=$(find_single_bids_file \
-            "$func_dir" "$id_key" \
-            "from-boldref_to-T1w_mode-image_desc-coreg_xfm.txt" \
-            "BOLD-to-T1w transform" \
-            __ANY__ __ANY__ __ANY__ __NONE__ __ANY__)
-    fi
-
     if ! mask_func_space=$(find_single_bids_file \
         "$func_dir" "$id_key" "desc-brain_mask.nii.gz" \
         "functional brain mask in $func_space" \
@@ -1834,14 +1827,43 @@ resolve_subject_session_inputs() {
                 __ANY__ "$anat_acq_spec" __ANY__ "$func_space" __ANY__)
         fi
 
-        if ! refbold_native=$(find_single_bids_file \
-            "$func_dir" "$id_key" "desc-coreg_boldref.nii.gz" \
-            "native/coregistered BOLD reference" \
+        # Prefer an entity-matched BOLD reference that is already in T1w
+        # space. The MNI work-item resolution must not be applied here because
+        # a T1w-space boldref may use a different grid or omit res-* entirely.
+        if refbold_t1w=$(find_single_bids_file \
+            "$func_dir" "$id_key" "boldref.nii.gz" \
+            "existing BOLD reference in T1w space" \
             "$task_spec" "$func_acq_spec" "$func_run_spec" \
-            __NONE__ __ANY__)
+            T1w __ANY__ optional)
         then
-            log_error "Could not find native/coregistered BOLD reference for $id_key"
-            return 1
+            log_info \
+                "Using existing T1w-space BOLD reference for T1-to-BOLD NMI"
+            log_debug "refbold_t1w=$refbold_t1w"
+        else
+            refbold_t1w=""
+
+            log_info \
+                "No existing T1w-space BOLD reference found; resolving native BOLD and transform"
+
+            refbold_native=$(find_single_bids_file \
+                "$func_dir" "$id_key" "desc-coreg_boldref.nii.gz" \
+                "native/coregistered BOLD reference" \
+                "$task_spec" "$func_acq_spec" "$func_run_spec" \
+                __NONE__ __ANY__)
+
+            if ! matrix=$(find_single_bids_file \
+                "$func_dir" "$id_key" \
+                "from-boldref_to-T1w_mode-image_desc-coreg_xfm.txt" \
+                "entity-specific BOLD-to-T1w transform" \
+                "$task_spec" "$func_acq_spec" "$func_run_spec" \
+                __NONE__ __ANY__ optional)
+            then
+                matrix=$(find_single_bids_file \
+                    "$func_dir" "$id_key" \
+                    "from-boldref_to-T1w_mode-image_desc-coreg_xfm.txt" \
+                    "BOLD-to-T1w transform" \
+                    __ANY__ __ANY__ __ANY__ __NONE__ __ANY__)
+            fi
         fi
 
         mask_func_mni="$mask_func_space"
@@ -1856,6 +1878,8 @@ resolve_subject_session_inputs() {
         refbold_mni=""
         mask_func_native="$mask_func_space"
         refbold_native="$refbold_space"
+        refbold_t1w=""
+        matrix=""
     fi
 
     log_ok "Input files resolved"
@@ -1872,10 +1896,11 @@ resolve_subject_session_inputs() {
     log_debug "anat_t1=$anat_t1"
     log_debug "mask_anat_native=$mask_anat_native"
     log_debug "gm_seg_native=$gm_seg_native"
-    log_debug "matrix=$matrix"
+    log_debug "matrix=${matrix:-}"
     log_debug "mask_func_space=$mask_func_space"
     log_debug "refbold_space=$refbold_space"
-    log_debug "refbold_native=$refbold_native"
+    log_debug "refbold_native=${refbold_native:-}"
+    log_debug "refbold_t1w=${refbold_t1w:-}"
     log_debug "anat_mni=${anat_mni:-}"
     log_debug "mask_anat_mni=${mask_anat_mni:-}"
     log_debug "gm_seg_mni=${gm_seg_mni:-}"
@@ -2053,23 +2078,24 @@ process_subject_session() {
             # may have a different voxel grid or resolution from the
             # anatomical T1w image. Resample them onto the anatomical grid
             # before calculating Dice and dropout.
-            local ref_img="$mask_anat_space"
-
+            local ref_anatmask="$mask_anat_space"
+            local ref_t1="$anat_t1"
             log_step \
                 "Resampling T1w-spaced functional inputs to the T1w grid"
 
             if ! resample_to_t1 \
                 "$mask_func_space" \
                 "$refbold_native" \
-                "$ref_img"
+                "$ref_anatmask" \
+                "$ref_t1"
             then
                 log_error \
                     "Could not resample T1w functional inputs to the anatomical grid"
                 return 1
             fi
 
-            # mask_func_space="$mask_func_anatres"
-            # refbold_native="$refbold_anatres"
+            mask_func_space="$mask_func_anatres"
+            refbold_space="$refbold_anatres"
 
             log_debug \
                 "resampled_mask_func_space=$mask_func_space"
@@ -2123,8 +2149,9 @@ process_subject_session() {
             transform_bold_t1space \
                 "$id_key" \
                 "$anat_t1" \
-                "$matrix" \
-                "$refbold_native"
+                "${matrix:-}" \
+                "${refbold_native:-}" \
+                "${refbold_t1w:-}"
         )
         then
             log_error "BOLD-to-T1 transform failed"
@@ -2537,7 +2564,7 @@ run_dataset() {
         --line-buffer \
         --colsep '	' \
         --joblog "$tmp_dir/parallel_joblog.tsv" \
-        --results "$tmp_dir/parallel_logs" \
+        --results "$tmp_dir/parallel_logs/{#}_{1}_task-{2}_acq-{3}_run-{4}_space-{5}_res-{6}.stdout" \
         parallel_worker '{1}' '{2}' '{3}' '{4}' '{5}' '{6}' \
         :::: "$work_items_tsv"
 
