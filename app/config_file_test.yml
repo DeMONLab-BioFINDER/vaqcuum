@@ -1,12 +1,12 @@
 # user action: Configure the paths and settings for the vaqcuum pipeline
 
 paths:
-  input_dir: "/Users/ga0034de/Desktop/test_fmriprepdset"
+  input_dir: "/Volumes/research/LU26D1023-DemonLab/DemonLab/ROSMAP/derivatives/fmriprep/unzipped/"
 
-  output_dir: "/Users/ga0034de/Desktop/test_output"
-  extracted_metrics_file: "{output_dir}/extracted_metrics.csv"
+  output_dir: "/Users/ga0034de/Desktop/metrics_rosmap_2407"
+  extracted_metrics_file: "{output_dir}/rosmap_metrics2407.csv"
 
-  tmp_dir: "/Users/ga0034de/Desktop/test_temp"
+  tmp_dir: "/Users/ga0034de/Desktop/metrics_temp"
 
   # if internet, fetch template flow
   # provide templateflow path
@@ -16,7 +16,7 @@ paths:
   #anat_earliest_ses: "no"
 
 parallelization:
-  n_jobs: 5
+  n_jobs: 2
 
 
 settings:
