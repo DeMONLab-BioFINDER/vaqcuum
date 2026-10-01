@@ -1,11 +1,11 @@
 .DS_Store
 .gitignore
 app/config_file_test.yml
+metric-explorer-output
 *.html
 *.csv
 *.js
 *.map
 *.css
-app/__pycache__/dataset_utils.cpython-313.pyc
+app/__pycache__/*
 *.scss
-*.txt

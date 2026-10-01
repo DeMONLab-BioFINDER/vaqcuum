@@ -1,0 +1,54 @@
+# vaqcuum dependencies
+#
+# python packages below can be installed with
+#   python -m pip install -r requirements.txt
+#
+# non-python dependencies are documented as comments because pip cannot install them
+
+# runtimes
+# python >= 3.10
+# bash >= 3.2
+# r >= 4.1 for metric_explorer.Rmd
+
+# python packages used by vaqcuum
+numpy
+pandas
+templateflow
+
+# python packages used by metric_explorer.Rmd through reticulate
+scipy
+scikit-learn
+
+# command-line dependencies used by the vaqcuum app
+# yq >= 4
+# gnu parallel
+# fsl
+#   fslstats
+#   fslmaths
+# ants
+#   antsApplyTransforms
+#   MeasureImageSimilarity
+#   ImageIntensityStatistics
+
+# standard shell tools expected on the system
+# awk
+# find
+# grep
+# sed
+# sort
+# tr
+
+# r packages used by metric_explorer.Rmd
+# tidyverse
+# robustbase
+# reticulate
+# plotly
+# htmlwidgets
+# htmltools
+# rmarkdown
+# knitr
+
+# notes
+# templateflow is only required when processing mni work items
+# metric_explorer.Rmd reads the final qc csv directly
+# jq and unzip are no longer required by the current app
