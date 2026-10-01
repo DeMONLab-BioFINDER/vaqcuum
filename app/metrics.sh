@@ -1,5 +1,4 @@
-# Use the runner's colored logger when available. These fallbacks allow this
-# file to be sourced independently without producing "command not found".
+# use runner logging when available
 if ! declare -F log_info >/dev/null 2>&1; then
     log_info()  { printf '[INFO ] %s\n' "$*" >&2; }
     log_ok()    { printf '[OK   ] %s\n' "$*" >&2; }
@@ -9,9 +8,7 @@ if ! declare -F log_info >/dev/null 2>&1; then
     log_debug() { :; }
 fi
 
-# ============================================================
-# METRIC 1: DICE
-# ============================================================
+# dice
 
 extract_dice_metric() {
     local id_key="$1"
@@ -20,6 +17,8 @@ extract_dice_metric() {
     local space="${4:-}"
     local task="${5:-}"
     local acq="${6:-}"
+    local run="${7:-}"
+    local resolution="${8:-}"
 
     local intersection
     intersection="$id_tmp_dir/${id_key}_mask_intersection.nii.gz"
@@ -39,21 +38,7 @@ extract_dice_metric() {
     log_debug "Dice anatomical mask: $anat_mask"
     log_debug "Dice functional mask: $func_mask"
 
-    # !!! if space not MNI, then resample func mask to anat space
-    if [[ "$space" != *"MNI"* ]]; then
-        local func_mask_resampled
-        func_mask_resampled="$id_tmp_dir/${id_key}_func_mask_resampled.nii.gz"
-        log_info "Resampling functional mask to anatomical space for Dice calculation"
-        antsApplyTransforms \
-            -d 3 \
-            -i "$func_mask" \
-            -r "$anat_mask" \
-            -o "$func_mask_resampled" \
-            -n NearestNeighbor \
-            >&2
-        func_mask="$func_mask_resampled"
-        log_debug "Resampled functional mask: $func_mask"
-    fi
+    # inputs are aligned by the runner before metric extraction
 
     anat_voxels=$(fslstats "$anat_mask" -V | awk '{print $1}')
     func_voxels=$(fslstats "$func_mask" -V | awk '{print $1}')
@@ -62,33 +47,33 @@ extract_dice_metric() {
 
     intersection_voxels=$(fslstats "$intersection" -V | awk '{print $1}')
 
-    dice_val=$(python3 -c \
+    dice_val=$("$python_bin" -c \
         "print(round(2 * $intersection_voxels / ($anat_voxels + $func_voxels), 6))")
 
     rm -f "$intersection"
 
     {
-        echo "id_key,space,task,acq,dice_val"
-        echo "$id_key,$space,$task,$acq,$dice_val"
+        echo "id_key,space,task,acq,run,resolution,dice_val"
+        echo "$id_key,$space,$task,$acq,$run,$resolution,$dice_val"
     } > "$metric_file"
 
     log_ok "Dice complete: value=$dice_val"
     log_debug "Dice CSV: $metric_file"
 }
 
-# ============================================================
-# METRIC 2: DROPOUT
-# ============================================================
+# dropout
 
 extract_dropout_metric() {
     local id_key="$1"
     local gm_seg_file="$2"
-    local anat_mask_mni="$3"
-    local func_mask_mni="$4"
+    local anat_mask="$3"
+    local func_mask="$4"
     local refbold_file="$5"
     local space="${6:-}"
     local task="${7:-}"
     local acq="${8:-}"
+    local run="${9:-}"
+    local resolution="${10:-}"
 
     local mask_gm_thr
     local mask_merged
@@ -106,9 +91,6 @@ extract_dropout_metric() {
     local nvox_gm
     local intensity_gm
     local intensity_dropout
-    local dropout_intensity
-    local dropout_size
-    local dropout_compo
 
     metric_file="$dropout_dir/${id_key}_dropout.csv"
 
@@ -122,16 +104,16 @@ extract_dropout_metric() {
 
     log_step "Dropout: thresholding gray matter and BOLD coverage"
     log_debug "Dropout GM segmentation: $gm_seg_file"
-    log_debug "Dropout anatomical mask: $anat_mask_mni"
-    log_debug "Dropout functional mask: $func_mask_mni"
+    log_debug "Dropout anatomical mask: $anat_mask"
+    log_debug "Dropout functional mask: $func_mask"
     log_debug "Dropout BOLD reference: $refbold_file"
 
     fslmaths "$gm_seg_file" \
         -thr "$gm_threshold" \
         -bin "$mask_gm_thr"
 
-    fslmaths "$anat_mask_mni" \
-        -add "$func_mask_mni" \
+    fslmaths "$anat_mask" \
+        -add "$func_mask" \
         -thr 1 \
         -bin "$mask_merged"
 
@@ -172,50 +154,8 @@ extract_dropout_metric() {
     intensity_gm=$(fslstats "$refbold_file" -k "$mask_gm_thr_clean" -M)
     intensity_dropout=$(fslstats "$refbold_file" -k "$mask_dropout" -M)
 
-    dropout_intensity=$(python3 - "$intensity_dropout" "$intensity_gm" <<'PY'
-import sys
-import math
-
-numerator = float(sys.argv[1])
-denominator = float(sys.argv[2])
-
-if denominator == 0 or math.isnan(denominator):
-    print("nan")
-else:
-    print(numerator / denominator)
-PY
-)
-
-    dropout_size=$(python3 - "$vol_dropout" "$vol_gm" <<'PY'
-import sys
-import math
-
-numerator = float(sys.argv[1])
-denominator = float(sys.argv[2])
-
-if denominator == 0 or math.isnan(denominator):
-    print("nan")
-else:
-    print(numerator / denominator)
-PY
-)
-
-    dropout_compo=$(python3 - "$dropout_intensity" "$dropout_size" <<'PY'
-import sys
-import math
-
-dropout_intensity = float(sys.argv[1])
-dropout_size = float(sys.argv[2])
-
-if math.isnan(dropout_intensity) or math.isnan(dropout_size):
-    print("nan")
-else:
-    print((1 - dropout_intensity) + dropout_size)
-PY
-)
-
-    log_info "Dropout summary: GM volume=$vol_gm, dropout volume=$vol_dropout, intensity ratio=$dropout_intensity"
-    log_ok "Dropout complete: composite=$dropout_compo"
+    log_info "Dropout summary: GM volume=$vol_gm, dropout volume=$vol_dropout"
+    log_ok "Dropout inputs complete"
 
     rm -f \
         "$mask_gm_thr_clean" \
@@ -224,16 +164,14 @@ PY
         "$new_mask_func_inv"
 
     {
-        echo "id_key,space,task,acq,volume_gm,nvox_gm,intensity_gm,volume_dropout,nvox_dropout,intensity_dropout,dropout_intensity,dropout_size,dropout_compo"
-        echo "$id_key,$space,$task,$acq,$vol_gm,$nvox_gm,$intensity_gm,$vol_dropout,$nvox_dropout,$intensity_dropout,$dropout_intensity,$dropout_size,$dropout_compo"
+        echo "id_key,space,task,acq,run,resolution,volume_gm,nvox_gm,intensity_gm,volume_dropout,nvox_dropout,intensity_dropout"
+        echo "$id_key,$space,$task,$acq,$run,$resolution,$vol_gm,$nvox_gm,$intensity_gm,$vol_dropout,$nvox_dropout,$intensity_dropout"
     } > "$metric_file"
 
     log_debug "Dropout CSV: $metric_file"
 }
 
-# ============================================================
-# METRIC 3: MATTES / ENTROPY
-# ============================================================
+# nmi
 
 transform_bold_t1space() {
     local id_key="$1"
@@ -244,7 +182,7 @@ transform_bold_t1space() {
 
     local bold_t1space
 
-    # Prefer an already available BOLD reference in T1w space.
+    # prefer an existing bold reference in t1w space
     if [[ -n "$existing_t1w_boldref" && -f "$existing_t1w_boldref" ]]; then
         log_step "Registration: using existing BOLD reference in T1w space"
         log_debug "Existing T1w-space BOLD reference: $existing_t1w_boldref"
@@ -253,7 +191,7 @@ transform_bold_t1space() {
         return 0
     fi
 
-    # The provided reference may itself already be in T1w space.
+    # reuse the provided reference when it is already in t1w space
     if [[ -f "$refbold_file" && "$(basename "$refbold_file")" == *_space-T1w_* ]]; then
         log_step "Registration: BOLD reference is already in T1w space"
         log_debug "T1w-space BOLD reference: $refbold_file"
@@ -264,7 +202,7 @@ transform_bold_t1space() {
 
     bold_t1space="${id_tmp_dir}/${id_key}_space-T1w_desc-coreg_boldref.nii.gz"
 
-    # Reuse a previously generated transform output.
+    # reuse a previous transform output
     if [[ -f "$bold_t1space" ]]; then
         log_step "Registration: reusing transformed BOLD reference in T1w space"
         log_debug "Transformed BOLD reference: $bold_t1space"
@@ -305,6 +243,8 @@ extract_nmi_metric() {
     local space="${9:-}"
     local task="${10:-}"
     local acq="${11:-}"
+    local run="${12:-}"
+    local resolution="${13:-}"
 
     local metric_file
     local t1_mask_boldres
@@ -324,18 +264,16 @@ extract_nmi_metric() {
     log_step "NMI: validating inputs and computing entropy terms"
     log_debug "NMI T1: $t1"
     log_debug "NMI T1 mask: $t1_mask"
-    log_debug "NMI BOLD reference in T1 space: $refbold_t1space"
+    log_debug "NMI BOLD reference in T1w space: $refbold_t1space"
     log_debug "NMI warped T1: $wt1"
     log_debug "NMI template T1: $mni_template"
     log_debug "NMI template mask: $mni_mask"
 
+    # t1 bold nmi inputs are required for every space
     for required_file in \
         "$t1" \
         "$t1_mask" \
-        "$refbold_t1space" \
-        "$wt1" \
-        "$mni_template" \
-        "$mni_mask"
+        "$refbold_t1space"
     do
         if [[ ! -f "$required_file" ]]; then
             log_error "Missing NMI input file: $required_file"
@@ -343,6 +281,26 @@ extract_nmi_metric() {
         fi
     done
 
+    # warped t1 template nmi is only defined for mni work items
+    if [[ "$space" == *"MNI"* ]]; then
+        for required_file in \
+            "$wt1" \
+            "$mni_template" \
+            "$mni_mask"
+        do
+            if [[ ! -f "$required_file" ]]; then
+                log_error "Missing MNI NMI input file: $required_file"
+                return 1
+            fi
+        done
+
+        if [[ -z "$entropy_mni" || "$entropy_mni" == "NA" ]]; then
+            log_error "Missing template entropy for MNI NMI"
+            return 1
+        fi
+    fi
+
+    # evaluate t1 bold nmi on the bold reference voxel grid
     log_info "NMI: resampling T1 mask and T1 image into the BOLD-reference grid"
     antsApplyTransforms \
         -d 3 \
@@ -360,7 +318,7 @@ extract_nmi_metric() {
         -n BSpline \
         >&2
 
-    log_info "NMI: measuring T1/BOLD and warped-T1/template similarity"
+    log_info "NMI: measuring T1/BOLD similarity"
     mattes_t1_bold=$(MeasureImageSimilarity \
         -d 3 \
         -m "Mattes[${t1_boldres},${refbold_t1space},1,${mattes_bins}]" \
@@ -378,17 +336,18 @@ extract_nmi_metric() {
             3 "$refbold_t1space" "$t1_mask_boldres" |
             awk 'NR == 2 {print $6}'
     )
-    # do this only if space contains mni
+    # the second nmi term is only defined for mni work items
     if [[ "$space" == *"MNI"* ]]; then
         entropy_wt1=$(
             ImageIntensityStatistics \
                 3 "$wt1" "$mni_mask" |
                 awk 'NR == 2 {print $6}'
         )
+        log_info "NMI: measuring warped-T1/template similarity"
         mattes_wt1_mni=$(MeasureImageSimilarity \
-        -d 3 \
-        -m "Mattes[${wt1},${mni_template},1,${mattes_bins}]" \
-        -x "$mni_mask")
+            -d 3 \
+            -m "Mattes[${wt1},${mni_template},1,${mattes_bins}]" \
+            -x "$mni_mask")
     else
         entropy_wt1="NA"
         mattes_wt1_mni="NA"
@@ -406,8 +365,8 @@ extract_nmi_metric() {
     fi
 
     {
-        echo "id_key,space,task,acq,mattes_t1_bold,mattes_wt1_mni,entropy_t1,entropy_bold,entropy_wt1,entropy_mni"
-        echo "$id_key,$space,$task,$acq,$mattes_t1_bold,$mattes_wt1_mni,$entropy_t1,$entropy_bold,$entropy_wt1,$entropy_mni"
+        echo "id_key,space,task,acq,run,resolution,mattes_t1_bold,mattes_wt1_mni,entropy_t1,entropy_bold,entropy_wt1,entropy_mni"
+        echo "$id_key,$space,$task,$acq,$run,$resolution,$mattes_t1_bold,$mattes_wt1_mni,$entropy_t1,$entropy_bold,$entropy_wt1,$entropy_mni"
     } > "$metric_file"
 
     log_info "NMI terms: T1/BOLD=$mattes_t1_bold, warped-T1/template=$mattes_wt1_mni"
@@ -419,13 +378,13 @@ extract_nmi_metric() {
         "$t1_boldres"
 }
 
-compute_nmi_merge_metrics() {
+merge_metrics() {
     log_step "Merge: loading per-id CSV files and calculating final NMI columns"
     log_debug "Dice directory: $dice_dir"
     log_debug "Dropout directory: $dropout_dir"
     log_debug "NMI directory: $nmi_dir"
 
-    python - \
+    "$python_bin" - \
         "$dice_dir" \
         "$dropout_dir" \
         "$nmi_dir" \
@@ -437,7 +396,7 @@ import numpy as np
 
 dice_dir, dropout_dir, nmi_dir, output_file = map(Path, sys.argv[1:5])
 
-keys = ["id_key", "space", "task", "acq"]
+keys = ["id_key", "space", "task", "acq", "run", "resolution"]
 
 def read_metric_dir(metric_dir: Path, label: str) -> pd.DataFrame:
     files = sorted(metric_dir.glob("*.csv"))
@@ -447,7 +406,7 @@ def read_metric_dir(metric_dir: Path, label: str) -> pd.DataFrame:
 
     frames = []
     for file in files:
-        df = pd.read_csv(file)
+        df = pd.read_csv(file, keep_default_na=False)
 
         if df.empty:
             raise SystemExit(f"ERROR: Empty CSV file for {label}: {file}")
@@ -476,7 +435,7 @@ def numeric_col(df: pd.DataFrame, col: str) -> pd.Series:
 def safe_nmi(entropy_a: pd.Series, entropy_b: pd.Series, mattes_term: pd.Series) -> pd.Series:
     out = (2*mattes_term) / (entropy_a + entropy_b)
     out = out.replace([np.inf, -np.inf], np.nan)
-    # making NMI the higher the better. Multiple by 10 to also make it more comparable
+    # make nmi higher-is-better and scale by 10
     out = round((-1 * 10 * out), 6)
     return out
 
@@ -504,7 +463,7 @@ dropout["dropout_compo"] = (1 - dropout["dropout_intensity"]) + dropout["dropout
 
 dropout = round(dropout.replace([np.inf, -np.inf], np.nan), 6)
 
-# Keep only this dropout metric in the final merged CSV
+# keep only the composite dropout metric in the final csv
 dropout = dropout[keys + ["dropout_compo"]].copy()
 
 nmi_raw = read_metric_dir(nmi_dir, "nmi")
@@ -531,35 +490,8 @@ merged = (
 
 merged = merged.sort_values(keys).reset_index(drop=True)
 
-# Copy the MNI nmi_t1_bold value onto the corresponding T1w row.
-mni_space_mask = (
-    merged["space"]
-    .astype("string")
-    .str.contains("MNI", case=False, na=False)
-)
-
+# warped t1 mni nmi remains undefined for t1w rows
 t1w_space_masking = merged["space"].eq("T1w")
-
-matching_mni_nmi = (
-    merged["nmi_t1_bold"]
-    .where(mni_space_mask)
-    .groupby(
-        [
-            merged["id_key"],
-            merged["task"],
-            merged["acq"],
-        ],
-        dropna=False,
-    )
-    .transform("first")
-)
-
-rows_to_update = t1w_space_masking & matching_mni_nmi.notna()
-
-merged.loc[rows_to_update, "nmi_t1_bold"] = (
-    matching_mni_nmi.loc[rows_to_update]
-)
-
 merged.loc[t1w_space_masking, "nmi_wt1_mni"] = np.nan
 
 final_columns = [
@@ -567,6 +499,8 @@ final_columns = [
     "space",
     "task",
     "acq",
+    "run",
+    "resolution",
     "dice_val",
     "dropout_compo",
     "nmi_t1_bold",
@@ -586,12 +520,19 @@ if missing_columns:
 merged = merged[final_columns]
 output_file.parent.mkdir(parents=True, exist_ok=True)
 
-# if id_key contains ses-id, we can split it into sub_id and ses_id columns
+# normalize subject and session columns for both dataset layouts
 if merged["id_key"].str.contains("_ses-").any():
-    merged[["sub_id", "ses_id"]] = merged["id_key"].str.split("_ses-", n=1, expand=True)
-    merged["ses_id"] = "ses-" + merged["ses_id"]
+    split_ids = merged["id_key"].str.split("_ses-", n=1, expand=True)
+    merged["sub_id"] = split_ids[0]
+    merged["ses_id"] = split_ids[1].fillna("")
+    merged.loc[merged["ses_id"].ne(""), "ses_id"] = "ses-" + merged.loc[merged["ses_id"].ne(""), "ses_id"]
     final_columns = ["sub_id", "ses_id"] + [col for col in final_columns if col != "id_key"]
     merged = merged[final_columns]
+else:
+    merged = merged.rename(columns={"id_key": "sub_id"})
+    final_columns = ["sub_id"] + [col for col in final_columns if col != "id_key"]
+    merged = merged[final_columns]
+
 merged.to_csv(output_file, index=False)
 
 print(f"Wrote merged metrics to: {output_file}", file=sys.stderr)

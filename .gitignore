@@ -1,1 +1,11 @@
 .DS_Store
+.gitignore
+app/config_file_test.yml
+*.html
+*.csv
+*.js
+*.map
+*.css
+app/__pycache__/dataset_utils.cpython-313.pyc
+*.scss
+*.txt

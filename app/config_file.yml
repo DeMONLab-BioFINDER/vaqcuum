@@ -1,43 +1,20 @@
-# user action: Configure the paths and settings for the vaqcuum pipeline
+# configure paths and metric settings
 
 paths:
-  tmp_dir: "/Users/ga0034de/Desktop/test_temp"
-
-  # Reference images
-  mni: "/Users/ga0034de/Downloads/templateflow/tpl-MNI152NLin6Asym/tpl-MNI152NLin6Asym_res-02_T1w.nii.gz"
-  mni_mask: "/Users/ga0034de/Downloads/templateflow/tpl-MNI152NLin6Asym/tpl-MNI152NLin6Asym_res-02_desc-brain_mask.nii.gz"
-  mni_type_res: "MNI152NLin6Asym_res-2"
-  
-outputs:
-  output_dir: "/Users/ga0034de/Desktop/test_output"
+  input_dir: "/path/to/derivatives"
+  output_dir: "/path/to/output"
   extracted_metrics_file: "{output_dir}/extracted_metrics.csv"
+  tmp_dir: "/path/to/tmp"
 
-inputs:
-  input_dir: "/Users/ga0034de/Desktop/test_fmriprepdset"
+  # leave empty to use a temporary templateflow cache
+  templateflow_dir: ""
 
-  # Options for specifying the derivative directory structure:
-  # "{input_dir}/{sub_id}_{ses_id}_fmriprep*" (flat)
-  # or "{input_dir}/{sub_id}/{ses_id}" (nested)
-  derivative_structure: "{input_dir}/{sub_id}/{ses_id}"
-  #"{input_dir}/{sub_id}_{ses_id}_fmriprep*"
-  
-  # if your nested derivative structure has processed anat scans in the first session folder only (fmriprep's design), set this to "yes". If not, set to "no"
-  anat_earliest_ses: "no"
-
-
-bids_filters:
-  # If you want to focus on specific acquisitions or tasks, you can specify them here. 
-  # Otherwise, leave them empty to include all
-  # if null, type "null" and that string wont be considered. Else wildcard * considers all
-
-  t1w:
-    acquisition: "null"
-  bold:
-    task: "rest"
-    acquisition: "*"
+parallelization:
+  n_jobs: 4
 
 settings:
   gm_threshold: 0.3
   dropout_percentile: 10
   mattes_bins: 64
-  n_jobs: 4
+
+# use --bids-filter to restrict work items

@@ -1,43 +1,20 @@
-# user action: Configure the paths and settings for the vaqcuum pipeline
+# configure paths and metric settings
 
 paths:
   input_dir: "/Volumes/research/LU26D1023-DemonLab/DemonLab/ROSMAP/derivatives/fmriprep/unzipped/"
-
   output_dir: "/Users/ga0034de/Desktop/metrics_rosmap_2407"
   extracted_metrics_file: "{output_dir}/rosmap_metrics2407.csv"
-
   tmp_dir: "/Users/ga0034de/Desktop/metrics_temp"
 
-  # if internet, fetch template flow
-  # provide templateflow path
+  # leave empty to use a temporary templateflow cache
   templateflow_dir: ""
-
-  # if your nested derivative structure has processed anat scans in the first session folder only (fmriprep's design), set this to "yes". If not, set to "no"
-  #anat_earliest_ses: "no"
 
 parallelization:
   n_jobs: 2
 
-
 settings:
-# parameters for metrics extraction should be hardcoded for now
   gm_threshold: 0.3
   dropout_percentile: 10
   mattes_bins: 64
 
-  #should we also output scanwise metrics. 
-
-# ================
-# TBD
-
-## leave to user to do that
-# bids_filters:
-#   # If you want to focus on specific acquisitions or tasks, you can specify them here. 
-#   # Otherwise, leave them empty to include all
-#   # if null, type "null" and that string wont be considered. Else wildcard * considers all
-
-#   t1w:
-#     acquisition: "null"
-#   bold:
-#     task: "rest" #make *
-#     acquisition: "*"
+# use --bids-filter to restrict work items

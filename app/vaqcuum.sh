@@ -1,18 +1,12 @@
-#### note to self:
-# account for run- string too. DONE but NOT TESTED
-# add bids filter DONE and TESTED
-# add keep or delete working files DONE and TESTED
-
-# investigate session type: multi or single session DONE but NOT TESTED
-# if longitudinal dataset and cant find anat in later sessions, it means its in the very first one. use that for all the sessions. aka anat_earliest_ses: "yes"
-
 #!/usr/bin/env bash
 set -euo pipefail
 
+# parse cli options and hand control to runner.sh
+
 usage() {
-    cat <<'EOF'
+    cat <<'USAGE'
 Usage:
-  vaqcuum --config-file <config.yaml> [--bids-filter <filter.json>] [--no-temp-cleanup]
+  vaqcuum.sh --config-file <config.yaml> [--bids-filter <filter.json>] [--no-temp-cleanup]
 
 Options:
   --config-file, --config_file
@@ -26,7 +20,12 @@ Options:
 
   -h, --help
       Show this help message.
-EOF
+USAGE
+}
+
+# portable lowercase conversion for older bash versions
+to_lower() {
+    printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]'
 }
 
 config_file=""
@@ -38,6 +37,7 @@ if [[ "$#" -eq 0 ]]; then
     exit 1
 fi
 
+# parse cli options
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
         --config_file|--config-file)
@@ -46,7 +46,6 @@ while [[ "$#" -gt 0 ]]; do
                 usage >&2
                 exit 1
             fi
-
             config_file="$2"
             shift 2
             ;;
@@ -57,7 +56,6 @@ while [[ "$#" -gt 0 ]]; do
                 usage >&2
                 exit 1
             fi
-
             bids_filter="$2"
             shift 2
             ;;
@@ -72,16 +70,6 @@ while [[ "$#" -gt 0 ]]; do
             exit 0
             ;;
 
-        --)
-            shift
-
-            if [[ "$#" -gt 0 ]]; then
-                echo "ERROR: Unexpected positional arguments: $*" >&2
-                usage >&2
-                exit 1
-            fi
-            ;;
-
         *)
             echo "ERROR: Unknown option: $1" >&2
             usage >&2
@@ -90,6 +78,7 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
+# validate config and optional filter
 if [[ -z "$config_file" ]]; then
     echo "ERROR: You must specify --config-file or --config_file." >&2
     usage >&2
@@ -101,7 +90,8 @@ if [[ ! -f "$config_file" ]]; then
     exit 1
 fi
 
-case "${config_file,,}" in
+config_file_lower="$(to_lower "$config_file")"
+case "$config_file_lower" in
     *.yaml|*.yml)
         ;;
     *)
@@ -116,7 +106,8 @@ if [[ -n "$bids_filter" ]]; then
         exit 1
     fi
 
-    case "${bids_filter,,}" in
+    bids_filter_lower="$(to_lower "$bids_filter")"
+    case "$bids_filter_lower" in
         *.json)
             ;;
         *)
@@ -126,7 +117,8 @@ if [[ -n "$bids_filter" ]]; then
     esac
 fi
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# resolve runner relative to this script
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "Running vaqcuum with:"
 echo "  Config file: $config_file"
@@ -142,4 +134,5 @@ if (( no_temp_cleanup )); then
     runner_args+=(--no-temp-cleanup)
 fi
 
-bash "$script_dir/runner.sh" "${runner_args[@]}"
+# reuse the current bash interpreter
+exec "$BASH" "$script_dir/runner.sh" "${runner_args[@]}"
