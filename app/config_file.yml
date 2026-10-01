@@ -18,3 +18,8 @@ settings:
   mattes_bins: 64
 
 # use --bids-filter to restrict work items
+
+reporting:
+  # render one metric explorer per output space after metric extraction
+  metric_explorer: true
+  output_dir: "{output_dir}/metric-explorer"

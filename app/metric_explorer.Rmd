@@ -3,7 +3,7 @@ title: "QC metric explorer"
 output: html_document
 date: "`r Sys.Date()`"
 params:
-  qc_csv: "/Users/ga0034de/Desktop/test_metrics2409.csv"
+  qc_csv: "qc_metrics.csv"
   space: null
   output_dir: "metric-explorer-output"
 ---

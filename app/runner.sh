@@ -79,6 +79,7 @@ log_section() {
 # config and paths
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+metric_explorer_rmd="$script_dir/metric_explorer.Rmd"
 no_temp_cleanup=0
 config_file="${1:-}"
 shift || true
@@ -253,6 +254,15 @@ read_config() {
     dropout_percentile=$(read_yaml '.settings.dropout_percentile')
     mattes_bins=$(read_yaml '.settings.mattes_bins')
     n_jobs=$(read_yaml '.parallelization.n_jobs')
+
+    metric_explorer_enabled=$(read_yaml '.reporting.metric_explorer // true')
+    metric_explorer_dir=$(read_yaml '.reporting.output_dir // ""')
+
+    if [[ -n "$metric_explorer_dir" && "$metric_explorer_dir" != "null" ]]; then
+        metric_explorer_dir=$(expand_config_vars "$metric_explorer_dir")
+    else
+        metric_explorer_dir="$output_dir/metric-explorer"
+    fi
 }
 
 # dependency and input checks
@@ -346,6 +356,14 @@ PY
         log_error "parallelization.n_jobs must be >= 1"
         exit 1
     fi
+
+    case "$metric_explorer_enabled" in
+        true|false) ;;
+        *)
+            log_error "reporting.metric_explorer must be true or false"
+            exit 1
+            ;;
+    esac
 
     mkdir -p "$tmp_dir" "$output_dir"
 
@@ -993,6 +1011,99 @@ export_parallel_context() {
     export -f resample_to_t1
 }
 
+# metric explorer
+
+render_metric_explorer() {
+    if [[ "$metric_explorer_enabled" != "true" ]]; then
+        log_info "Metric explorer: disabled"
+        return 0
+    fi
+
+    if [[ ! -f "$metric_explorer_rmd" ]]; then
+        log_warn "Metric explorer skipped: file not found: $metric_explorer_rmd"
+        return 0
+    fi
+
+    if ! command -v Rscript >/dev/null 2>&1; then
+        log_warn "Metric explorer skipped: Rscript is not available"
+        return 0
+    fi
+
+    if ! Rscript -e 'pkgs <- c("rmarkdown", "tidyverse", "robustbase", "reticulate", "plotly", "htmlwidgets", "htmltools"); missing <- pkgs[!vapply(pkgs, requireNamespace, quietly=TRUE, FUN.VALUE=logical(1))]; if (length(missing)) { message("missing R packages: ", paste(missing, collapse=", ")); quit(status=1) }' >/dev/null 2>&1; then
+        log_warn "Metric explorer skipped: required R packages are missing"
+        return 0
+    fi
+
+    local spaces_file="$tmp_dir/metric_explorer_spaces.txt"
+    if ! "$python_bin" - "$extracted_metrics_file" >"$spaces_file" <<'PYSPACES'
+import csv
+import sys
+
+path = sys.argv[1]
+spaces = set()
+with open(path, newline="", encoding="utf-8") as handle:
+    reader = csv.DictReader(handle)
+    if not reader.fieldnames or "space" not in reader.fieldnames:
+        raise SystemExit("final qc csv has no space column")
+    for row in reader:
+        space = (row.get("space") or "").strip()
+        if space:
+            spaces.add(space)
+
+for space in sorted(spaces):
+    print(space)
+PYSPACES
+    then
+        log_warn "Metric explorer skipped: could not read output spaces"
+        return 0
+    fi
+
+    if [[ ! -s "$spaces_file" ]]; then
+        log_warn "Metric explorer skipped: no output spaces found"
+        return 0
+    fi
+
+    mkdir -p "$metric_explorer_dir"
+    log_step "Rendering metric explorer reports"
+
+    local space safe_space space_dir report_file
+    while IFS= read -r space; do
+        [[ -z "$space" ]] && continue
+
+        safe_space=$(printf '%s' "$space" | tr -c '[:alnum:]_.-' '_')
+        space_dir="$metric_explorer_dir/$safe_space"
+        report_file="metric_explorer_${safe_space}.html"
+        mkdir -p "$space_dir"
+
+        if Rscript - \
+            "$metric_explorer_rmd" \
+            "$extracted_metrics_file" \
+            "$space" \
+            "$space_dir" \
+            "$report_file" <<'RSCRIPT'
+args <- commandArgs(trailingOnly = TRUE)
+
+rmarkdown::render(
+  input = args[[1]],
+  params = list(
+    qc_csv = args[[2]],
+    space = args[[3]],
+    output_dir = args[[4]]
+  ),
+  output_file = args[[5]],
+  output_dir = args[[4]],
+  envir = new.env(parent = globalenv()),
+  quiet = TRUE
+)
+RSCRIPT
+        then
+            log_ok "Metric explorer ready: $space_dir/$report_file"
+        else
+            log_warn "Metric explorer failed for space=$space; QC metrics remain available"
+        fi
+    done <"$spaces_file"
+}
+
 # run dataset
 
 run_dataset() {
@@ -1084,7 +1195,11 @@ run_dataset() {
     if [[ -f "$extracted_metrics_file" ]]; then
         output_rows=$(awk 'END {print (NR > 0 ? NR - 1 : 0)}' "$extracted_metrics_file")
     fi
-    log_ok "Pipeline complete: wrote $output_rows row(s) to $extracted_metrics_file"
+    log_ok "Metric extraction complete: wrote $output_rows row(s) to $extracted_metrics_file"
+
+    render_metric_explorer
+
+    log_ok "Pipeline complete"
 }
 
 # main
